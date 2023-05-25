@@ -1,0 +1,4067 @@
+---
+title: "Data analysis for 'The dependence of forecasts on sampling frequency as a guide to optimizing monitoring in community ecology'"
+
+author: "Daugaard et al. (2023)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    number_sections: true
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Note that several code chunks have the option "Eval=FALSE" which means that they are not run. This is because they take too long (the complete forecasting takes days, up to weeks). Instead, the related results are loaded in later in the code (often in the subsequent code chunk). The data will eventually be saved in the folder "Data".
+
+
+# Dependencies, functions and data
+
+## Dependencies
+
+```{r dependencies, include=FALSE}
+library(spatstat)
+library(tidyverse)
+library(patchwork)
+library(data.table)
+library(pracma)
+library(rEDM)
+library(parallel)
+library(doParallel) 
+library(lubridate)
+library(GGally)
+library(here)
+library(elasticnet)
+library(ggfortify)
+library(slider)
+library(ggpubr)
+library(lmerTest)
+library(merTools)
+library(RColorBrewer)
+library(truncnorm)
+library(forecast)
+library(viridis)
+library(lattice)
+library(odin)
+library(kableExtra)
+
+options(dplyr.summarise.inform = FALSE)
+options(tidyverse.quiet = TRUE)
+```
+
+
+## Most functions
+
+```{r load_own_fcts}
+source(file = here("R/Functions/forecasting_functions.R")) ## forecasting functions
+source(file = here("R/Functions/smap_interactions_functions.R")) ## Smap EDM interaction estimation functions
+source(file = here("R/Functions/number_of_interaction_functions.R")) ## CCM EDM number of interaction estimation 
+source(file = here("R/Functions/other_functions.R")) ## other useful functions
+```
+
+```{r functions_for_data_prep}
+time.interp.fun <- function(timestep){
+  nr.timepoints <- length(unique(timestep))
+  time.interp <- seq(min(timestep), max(timestep), length.out = nr.timepoints)
+  return(time.interp)
+}
+
+chi <- function(x,y,xi){
+  return(interp1(x, y, xi, method="cubic"))
+}
+
+detrended_moving_sd <- function(x, t, na.rm, time_col){
+
+  x$t <- unlist(x[,time_col])
+  res <- residuals(lm(value~t, data=x))
+
+  iqr <- IQR(res, na.rm = T)
+  lower_out <- quantile(res, na.rm = T, probs = 0.25)-1.5*iqr
+  upper_out <- quantile(res, na.rm = T, probs = 0.75)+1.5*iqr
+  res <- res[res>lower_out & res<upper_out]
+  sd <- sd(res, na.rm = na.rm)
+  return(sd)
+}
+
+noise_fun <- function(sd, val, mean=0){
+  r <- rtruncnorm(1, a = -val, mean=mean, sd = sd)
+  # r <- rnorm(1,mean,sd)
+  return(r)
+}
+```
+
+
+# Data and data processing
+
+## Interpolation 
+
+```{r daily_data, warning=FALSE, message=FALSE, cache=TRUE}
+ddHF_GRE_phylo <- read_csv("../../Data/Timeseries/abundance_sizebins_2019to2021.csv") %>%
+  dplyr::filter(date>="2019-04-02", date <= "2021-12-20")
+
+ddHF_GRE_phylo <- ddHF_GRE_phylo %>%
+  mutate(Cluster = case_when(bin=="< -3.63" ~ "cluster_1",
+                             bin=="(-3.63,-3.33]" ~ "cluster_2",
+                             bin=="(-3.33,-3.02]" ~ "cluster_3",
+                             bin=="(-3.02,-2.72]" ~ "cluster_4",
+                             bin=="(-2.72,-2.41]" ~ "cluster_5",
+                             bin=="> -2.41" ~ "cluster_6"))
+
+ddHF_GRE_phylo_wide <- ddHF_GRE_phylo %>%
+  dplyr::select(date, Cluster, roi_sec) %>%
+  pivot_wider(names_from = Cluster, values_from = roi_sec)
+
+ddHF_GRE_phylo_traits <- ddHF_GRE_phylo %>%
+  dplyr::select(date, Cluster, median_area) %>%
+  pivot_wider(names_from = Cluster, values_from = median_area)
+
+
+ddHF_GRE <- read_csv("../../Data/Timeseries/ctd_meteo_SPC_2019to2021_0to8m.csv") %>%
+  dplyr::filter(date>="2019-04-02", date <= "2021-12-20") %>%
+  dplyr::select(-cluster_1, -cluster_2, -cluster_3, -cluster_4,
+                -cluster_5, -cluster_6, -cluster_7, -cluster_8)
+
+ddHF_GRE <- full_join(ddHF_GRE, ddHF_GRE_phylo_wide)
+
+## data transformations
+
+water_chemistry <- c("Nitrat","oP","Ammonium") # oP = phosphate
+
+rotifers <- c("asplanchna", "brachionus", "kellikottia", "keratella_quadrata", "polyarthra",
+              "rotifers", "synchaeta", "keratella_cochlearis", "trichocerca", "conochilus")
+ciliates <- c("ciliate")
+daphnids <- c("daphnia", "bosmina", "diaphanosoma")
+cyclopoid_copepods <- c("cyclops")
+calanoid_copepods <- c("eudiaptomus")
+nauplii <- c("nauplius")
+
+zooplankton <- c(rotifers, ciliates, daphnids, cyclopoid_copepods, calanoid_copepods, nauplii)
+other_lake_characteristics <- c("mean_mixed_layer_depth","mean_epi_temp",
+                                "ml_irradiance")
+phytoplankton <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6")
+predators <- c("leptodora","chaoborus")
+other_organisms_excluded <- c("asterionella", "diatom_chain", "dinobryon", "ceratium",
+                              "fragilaria", "uroglena", "paradileptus",
+                              "aphanizomenon", "diatom")
+other_lake_char_excluded <- colnames(ddHF_GRE)[!(colnames(ddHF_GRE) %in% c("date",water_chemistry,zooplankton,predators,
+                                                               other_lake_characteristics,phytoplankton,other_organisms_excluded))]
+
+ddHF_GRE_long <- ddHF_GRE %>% 
+  dplyr::select(-sample) %>%
+  dplyr::mutate(row = row_number()) %>%
+  pivot_longer(cols = -c(date,row))
+
+ddHF_GRE_long <- ddHF_GRE_long %>%
+  dplyr::mutate(group = case_when(name %in% water_chemistry ~ "Water chemistry",
+                                  name %in% zooplankton ~ "Zooplankton",
+                                  name %in% other_lake_characteristics ~ "Other lake characteristics",
+                                  name %in% phytoplankton ~ "Phytoplankton",
+                                  name %in% other_organisms_excluded ~ "Other organisms excluded",
+                                  name %in% other_lake_char_excluded ~ "Other lake characteristics excluded",
+                                  name %in% predators ~ "Predators"),
+                subgroup = case_when(name %in% rotifers ~ "rotifers",
+                                     name %in% ciliates ~ "ciliates",
+                                     name %in% daphnids ~ "daphnids",
+                                     name %in% cyclopoid_copepods ~ "cyclopoid_copepods",
+                                     name %in% calanoid_copepods ~ "calanoid_copepods",
+                                     name %in% nauplii ~ "nauplii",
+                                     TRUE ~ name))
+
+
+ddHF_GRE_long_grouped <- ddHF_GRE_long %>%
+  group_by(date,subgroup,group,row) %>%
+  dplyr::summarize(allNA = all(is.na(value)),
+                   value = ifelse(allNA,NA,sum(value,na.rm = T))) %>%
+  dplyr::filter(group %in% c("Zooplankton","Predators","Phytoplankton","Other lake characteristics","Water chemistry")) %>%
+  dplyr::select(-allNA)
+
+percNA <- ddHF_GRE_long_grouped
+num_timepoints_tot <-  as.numeric(max(percNA$date) - min(percNA$date) + 1)
+percNA <- percNA %>%
+  na.omit() %>%
+  group_by(group,subgroup) %>%
+  summarize(numNA = num_timepoints_tot - n(),
+            percNA = 100*numNA/num_timepoints_tot)
+
+ddHF_GRE2 <- ddHF_GRE_long_grouped %>%
+  dplyr::filter(group != "Water chemistry") %>%
+  pivot_wider(names_from = subgroup, values_from = value, -group)
+
+ddHF_GRE2water <- ddHF_GRE_long_grouped %>%
+  dplyr::filter(group == "Water chemistry") %>%
+  pivot_wider(names_from = subgroup, values_from = value, -group)
+
+ddHF_GRE2_plot <- ddHF_GRE_long_grouped
+
+#### interpolation
+
+##### Everything but water chemistry
+
+set.seed(6)
+
+ddHF_GRE_long2 <- ddHF_GRE2 %>% 
+  pivot_longer(cols = -c(date,row))
+
+# ddHF_GRE_long2$name2 <- ddHF_GRE_long2$name
+
+ddHF_GRE_long2 <- ddHF_GRE_long2 %>% 
+  group_by(name) %>% 
+  mutate(days_since_start = time_length(interval(min(date),date), 
+                                        unit = 'day'),
+         imputed = ifelse(is.na(value),T,F))
+
+ddHF_GRE_long2 <- ddHF_GRE_long2 %>%
+  group_by(name) %>%
+  mutate(sd_class_moving = slide_dbl(.x = cur_data(), .f = detrended_moving_sd, .before = 20, .after= 20, na.rm = T, time_col="days_since_start"))
+
+
+
+which_imputed <- ddHF_GRE_long2 %>% 
+  dplyr::select(date, name, days_since_start, imputed, sd_class_moving) %>%
+  dplyr::rename(time=days_since_start)
+
+ddHF_GRE_long2$time <- unlist(ddHF_GRE_long2[,"days_since_start"])
+
+time.interp <- time.interp.fun(timestep = ddHF_GRE_long2$time)
+ddHF_GRE_long2 <- ddHF_GRE_long2 %>% na.omit()
+ddHF_GRE_long2 <- setDT(ddHF_GRE_long2)[, list(time = time.interp,
+                                   value = chi(time, value, time.interp)), by = .(name)]
+
+ddHF_GRE_long2 <- ddHF_GRE_long2 %>%
+  dplyr::mutate(group = case_when(name %in% c("rotifers","calanoid_copepods","ciliates","cyclopoid_copepods","daphnids","nauplii") ~ "Zooplankton",
+                                  name %in% c("mean_epi_temp","mean_mixed_layer_depth","ml_irradiance") ~ "Other lake characteristics",
+                                  name %in% c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6") ~ "Phytoplankton",
+                                  name %in% c("chaoborus", "leptodora") ~ "Predators"))
+
+ddHF_GRE_long2 <- full_join(ddHF_GRE_long2, which_imputed)
+
+######## adding noise
+
+set.seed(7)
+
+ddHF_GRE_long2 <- ddHF_GRE_long2 %>%
+  group_by(name, time, date, group, imputed) %>%
+  mutate(noise = ifelse(imputed==T, noise_fun(sd_class_moving, value), 0),
+         value2 = value+noise,
+         value2 = ifelse(value2<1e-05,0,value2))
+
+##### Only water chemistry
+
+ddHF_GRE2water$days_since_start <- time_length(interval(min(ddHF_GRE2water$date),ddHF_GRE2water$date), unit = 'day')
+nd <- data.frame(days_since_start=min(ddHF_GRE2water$days_since_start, na.rm = T):max(ddHF_GRE2water$days_since_start, na.rm = T))
+
+loess_amm <- loess(Ammonium ~ days_since_start, data=ddHF_GRE2water, span=0.15, na.action = na.exclude)
+loess_nit <- loess(Nitrat ~ days_since_start, data=ddHF_GRE2water, span=0.15, na.action = na.exclude)
+loess_pho <- loess(oP ~ days_since_start, data=ddHF_GRE2water, span=0.15, na.action = na.exclude)
+
+ddHF_GRE2water$Ammonium_loess <- predict(loess_amm, newdata = nd)
+ddHF_GRE2water$Nitrat_loess <- predict(loess_nit, newdata = nd)
+ddHF_GRE2water$oP_loess <- predict(loess_pho, newdata = nd)
+ddHF_GRE2water$resid_amm <- resid(loess_amm)
+ddHF_GRE2water$resid_nit <- resid(loess_nit)
+ddHF_GRE2water$resid_pho <- resid(loess_pho)
+
+######## adding noise
+
+set.seed(8)
+
+amm_iqr <- IQR(ddHF_GRE2water$resid_amm, na.rm = T)
+nit_iqr <- IQR(ddHF_GRE2water$resid_nit, na.rm = T)
+pho_iqr <- IQR(ddHF_GRE2water$resid_pho, na.rm = T)
+
+lower_out_amm <- quantile(ddHF_GRE2water$resid_amm, na.rm = T, probs = 0.25)-1.5*amm_iqr
+lower_out_nit <- quantile(ddHF_GRE2water$resid_nit, na.rm = T, probs = 0.25)-1.5*nit_iqr
+lower_out_pho <- quantile(ddHF_GRE2water$resid_pho, na.rm = T, probs = 0.25)-1.5*pho_iqr
+
+upper_out_amm <- quantile(ddHF_GRE2water$resid_amm, na.rm = T, probs = 0.75)+1.5*amm_iqr
+upper_out_nit <- quantile(ddHF_GRE2water$resid_nit, na.rm = T, probs = 0.75)+1.5*nit_iqr
+upper_out_pho <- quantile(ddHF_GRE2water$resid_pho, na.rm = T, probs = 0.75)+1.5*pho_iqr
+
+resid_amm <- ddHF_GRE2water$resid_amm[ddHF_GRE2water$resid_amm>lower_out_amm & ddHF_GRE2water$resid_amm<upper_out_amm]
+resid_nit <- ddHF_GRE2water$resid_nit[ddHF_GRE2water$resid_nit>lower_out_nit & ddHF_GRE2water$resid_nit<upper_out_nit]
+resid_pho <- ddHF_GRE2water$resid_pho[ddHF_GRE2water$resid_pho>lower_out_pho & ddHF_GRE2water$resid_pho<upper_out_pho]
+
+ddHF_GRE2water$sd_amm <- sd(resid_amm, na.rm = T)
+ddHF_GRE2water$sd_nit <- sd(resid_nit, na.rm = T)
+ddHF_GRE2water$sd_pho <- sd(resid_pho, na.rm = T)
+
+ddHF_GRE2water$mean_amm <- mean(resid_amm, na.rm = T)
+ddHF_GRE2water$mean_nit <- mean(resid_nit, na.rm = T)
+ddHF_GRE2water$mean_pho <- mean(resid_pho, na.rm = T)
+
+set.seed(9)
+
+ddHF_GRE2water <- ddHF_GRE2water %>%
+  dplyr::mutate(amm_noise = ifelse(is.na(Ammonium), noise_fun(sd_amm, Ammonium_loess, mean_amm), 0),
+                nit_noise = ifelse(is.na(Nitrat), noise_fun(sd_nit, Nitrat_loess, mean_nit), 0),
+                pho_noise = ifelse(is.na(oP), noise_fun(sd_pho, oP_loess, mean_pho), 0),
+                Ammonium_loess2 = ifelse(is.na(Ammonium), Ammonium_loess + amm_noise, Ammonium),
+                Nitrat_loess2 = ifelse(is.na(Nitrat), Nitrat_loess + nit_noise, Nitrat),
+                oP_loess2 = ifelse(is.na(oP), oP_loess + pho_noise, oP),
+                Ammonium_loess2 = ifelse(Ammonium_loess2<0,0,Ammonium_loess2),
+                Nitrat_loess2 = ifelse(Nitrat_loess2<0,0,Nitrat_loess2),
+                oP_loess2 = ifelse(oP_loess2<0,0,oP_loess2))
+
+ddHF_GRE2water_long <- ddHF_GRE2water %>%
+  dplyr::select(date,days_since_start,Ammonium_loess2,Nitrat_loess2,oP_loess2) %>%
+  dplyr::rename(ammonium=Ammonium_loess2, nitrate=Nitrat_loess2, phosphate=oP_loess2, time=days_since_start) %>%
+  pivot_longer(cols = -c(date,time)) %>%
+  mutate(group = "Water chemistry",
+         value2=value) 
+
+
+#### joining the dataset again
+
+ddHF_GRE_long2 <- full_join(ddHF_GRE_long2, ddHF_GRE2water_long)
+
+ddHF_GRE_long3 <- ddHF_GRE_long2 %>%
+  ungroup() %>%
+  dplyr::select(group, time, date, imputed, sd_class_moving, noise, value2, name) %>%
+  dplyr::rename(value=value2) 
+
+ddHF_GRE_long3_nonstand <- ddHF_GRE_long3
+
+##############################################################
+## Coefficient of variation
+
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+temp <- ddHF_GRE2 %>% 
+  pivot_longer(cols = -c(date,row)) %>%
+  na.omit()
+
+cv <- temp %>%
+  dplyr::filter(name %in% targets) %>%
+  group_by(name) %>%
+  summarize(cv = sd(value)/mean(value),
+            sd = sd(value),
+            mean = mean(value)) 
+
+rm(targets)
+
+##############################################################
+## rest of transf
+
+ddHF_GRE_long3 <- data_transformation(ddHF_GRE_long3, time_column = "time", interpolation = F) 
+
+ddHF_GRE_long2 <- full_join(ddHF_GRE_long3, ddHF_GRE_long2 %>% dplyr::select(-value, -value2))
+
+
+## Wide format data
+
+ddHF_GRE2 <- ddHF_GRE_long2 %>%
+  ungroup() %>%
+  dplyr::select(-imputed, -noise, -sd_class_moving, -group, -date) %>%
+  pivot_wider(names_from = name,
+              values_from = value)
+
+ddHF_GRE2 <- ddHF_GRE2 %>% ungroup() %>%
+  dplyr::select(-chaoborus, -leptodora)
+```
+
+## Frequency sub-sampling
+
+```{r freq_sub_sample, warning=FALSE, message=FALSE, cache=TRUE}
+nrows <- nrow(ddHF_GRE2)
+nrows_longest_interval <- floor(nrows/12)
+
+timepoints_12 <- c()
+timepoints_6 <- c()
+timepoints_3 <- c()
+timepoints_1 <- c()
+
+ddHF_GRE2_12days <- list()
+ddHF_GRE2_6days <- list()
+ddHF_GRE2_3days <- list()
+ddHF_GRE2_1day <- list()
+
+SubSampler <- function(nrows, nrows_longest_interval, interval,
+                       timepoints, i, full_dat){
+  
+  seq <- seq(i,nrows,by=interval)[1:nrows_longest_interval] %>% na.omit()
+  if(!any(seq %in% timepoints)){
+    dat <- full_dat[seq,] 
+    if(nrow(dat)==nrows_longest_interval) {
+      return(list(data=dat, tp = c(timepoints, seq)))
+    } 
+  }
+  return(NULL)
+}
+
+for(i in 1:nrows){
+
+  # 12 days interval
+  sub12 <- SubSampler(nrows, nrows_longest_interval, 12, timepoints_12, i, ddHF_GRE2)
+  if(!is.null(sub12)){
+    ddHF_GRE2_12days[[length(ddHF_GRE2_12days)+1]] <- sub12$dat
+    timepoints_12 <- sub12$tp
+  }
+  
+  # 6 days interval
+  sub6 <- SubSampler(nrows, nrows_longest_interval, 6, timepoints_6, i, ddHF_GRE2)
+  if(!is.null(sub6)){
+    ddHF_GRE2_6days[[length(ddHF_GRE2_6days)+1]] <- sub6$dat
+    timepoints_6 <- sub6$tp
+  }
+  
+  # 3 days interval
+  sub3 <- SubSampler(nrows, nrows_longest_interval, 3, timepoints_3, i, ddHF_GRE2)
+  if(!is.null(sub3)){
+    ddHF_GRE2_3days[[length(ddHF_GRE2_3days)+1]] <- sub3$dat
+    timepoints_3 <- sub3$tp
+  }
+  
+  # 1 days interval
+  sub1 <- SubSampler(nrows, nrows_longest_interval, 1, timepoints_1, i, ddHF_GRE2)
+  if(!is.null(sub1)){
+    ddHF_GRE2_1day[[length(ddHF_GRE2_1day)+1]] <- sub1$dat
+    timepoints_1 <- sub1$tp
+  }
+}
+```
+
+
+## Number of time points sub-sampling
+
+```{r nt_sub_sample, warning=FALSE, message=FALSE, cache=TRUE}
+idx1 <- ceiling(0.25*nrow(ddHF_GRE2))
+idx2 <- floor(0.75*nrow(ddHF_GRE2))
+
+ddHF_GRE2_75perc <- list(
+  ddHF_GRE2[1:idx2,],
+  ddHF_GRE2[idx1:(idx1+idx2-1),]
+)
+
+idx1 <- floor(0.5*nrow(ddHF_GRE2))
+
+ddHF_GRE2_50perc <- list(
+  ddHF_GRE2[1:idx1,],
+  ddHF_GRE2[(idx1+1):(idx1*2),]
+)
+
+idx1 <- floor(0.25*nrow(ddHF_GRE2))
+
+ddHF_GRE2_25perc <- list(
+  ddHF_GRE2[1:idx1,],
+  ddHF_GRE2[(idx1+1):(idx1*2),],
+  ddHF_GRE2[(idx1*2+1):(idx1*3),],
+  ddHF_GRE2[(idx1*3+1):(idx1*4),]
+)
+
+idx1 <- floor((1/6)*nrow(ddHF_GRE2))
+
+ddHF_GRE2_16.7perc <- list(
+  ddHF_GRE2[1:idx1,],
+  ddHF_GRE2[(idx1+1):(idx1*2),],
+  ddHF_GRE2[(idx1*2+1):(idx1*3),],
+  ddHF_GRE2[(idx1*3+1):(idx1*4),],
+  ddHF_GRE2[(idx1*4+1):(idx1*5),],
+  ddHF_GRE2[(idx1*5+1):(idx1*6),]
+)
+```
+
+
+## Trait data
+
+```{r trait_data, message=FALSE, warning=FALSE, cache=TRUE}
+ddHF_GRE_phylo_traits <- read_csv("../../Data/Timeseries/abundance_sizebins_2019to2021.csv") %>%
+  dplyr::filter(date>="2019-04-02", date <= "2021-12-20")
+
+ddHF_GRE_phylo_traits <- ddHF_GRE_phylo_traits %>%
+  mutate(Cluster = case_when(bin=="< -3.63" ~ "cluster_1",
+                             bin=="(-3.63,-3.33]" ~ "cluster_2",
+                             bin=="(-3.33,-3.02]" ~ "cluster_3",
+                             bin=="(-3.02,-2.72]" ~ "cluster_4",
+                             bin=="(-2.72,-2.41]" ~ "cluster_5",
+                             bin=="> -2.41" ~ "cluster_6"))
+
+ddHF_GRE_phylo_traits <- ddHF_GRE_phylo_traits %>%
+  rename(group = Cluster,
+         area = median_area) %>%
+  dplyr::mutate(name=group) %>%
+  dplyr::select(-roi_sec, -bin, -mean_area)
+
+
+Traits <- read_csv("../../Data/Timeseries/DSPC_ROI_area_April2019_April2022.csv") %>%
+  dplyr::filter(date>="2019-04-02", date <= "2019-12-20",
+                !(taxa %in% c("cluster_1", "cluster_2", "cluster_3", "cluster_4",
+                              "cluster_5", "cluster_6", "cluster_7", "cluster_8")))
+
+Traits <- Traits %>%
+  na.omit() %>%
+  group_by(taxa, date, unit_area, magnification) %>%
+  summarize(area = mean(area)) %>%
+  dplyr::filter(!(taxa %in% other_organisms_excluded)) %>%
+  dplyr::filter(!(taxa %in% c("dirt", "copepod_skins", "daphnia_skins", "filament", "fish",
+                               "folder", "hydra", "mag", "maybe_cyano", "unknown", "unknown_plankton", 
+                               "leptodora", "chaoborus"))) 
+ 
+Traits <- Traits %>%
+  dplyr::mutate(group = case_when(taxa %in% rotifers ~ "rotifers",
+                                  taxa %in% ciliates ~ "ciliates",
+                                  taxa %in% daphnids ~ "daphnids",
+                                  taxa %in% cyclopoid_copepods ~ "cyclopoid_copepods",
+                                  taxa %in% calanoid_copepods ~ "calanoid_copepods",
+                                  taxa %in% nauplii ~ "nauplii",
+                                  T ~ taxa),
+                date2 = as.character(date))
+
+
+Traits <- left_join(Traits, ddHF_GRE_long %>% dplyr::select(taxa=name, date, density=value)) %>%
+  na.omit()
+
+Traits <- Traits %>%
+  group_by(group, date, date2, unit_area, magnification) %>%
+  dplyr::filter(density>0) %>%
+  dplyr::mutate(weights = density/sum(density)) %>%
+  dplyr::summarize(area = weighted.median(area,weights)) %>%
+  dplyr::mutate(name=group) %>%
+  ungroup() %>%
+  dplyr::select(-date2, -unit_area, -magnification)
+
+Traits <- full_join(Traits,ddHF_GRE_phylo_traits)
+
+
+summarized_Traits <- Traits %>%
+  group_by(name) %>%
+  summarize(median_area = median(area, na.rm = T),
+            mean_area = mean(area, na.rm=T),
+            max_area=max(area,na.rm = T),
+            min_area=min(area,na.rm = T)) %>%
+  arrange(median_area) %>%
+  mutate(group = ifelse(name %in% c("ciliates","rotifers","nauplii","cyclopoid_copepods",
+                                    "calanoid_copepods","daphnids"),
+                        "Zooplankton", "Phytoplankton"))
+
+
+TraitsAndDensities <- full_join(ddHF_GRE_long_grouped, Traits %>% rename(subgroup=group)) %>% na.omit()
+```
+
+
+
+# Simulation: Forecast error as a function of growth rate
+
+## ODE and functions
+
+```{r ode, message=FALSE, warning=FALSE}
+##### logistic version with lag
+gen <- odin::odin({
+  Nlag <- delay(N, tau)
+  initial(N) <- N_ini
+  deriv(N) <- r * N * (1 - Nlag / K) 
+  tau <- user(3)
+  N_ini <- user(1000)
+  K <- user(1000)
+  r <- user(2.1)
+  output(Nlag) <- Nlag
+})
+```
+
+
+```{r decideE}
+# Function decide optimal E
+decideE <- function(values,lib,pred){
+  E <- which.max(EmbedDimension(dataFrame = data.frame(t=1:length(values),value2=values),
+                                lib = lib, pred = pred, columns = "value2", maxE=8,
+                                target = "value2", showPlot = F, numThreads = 1)$rho)
+  return(E)
+}
+```
+
+```{r simplex_wrap}
+# Forecasting wrapper function
+simplex_wrap <- function(values, lib, E, tp, evaldd, 
+                         SamplingInterval,
+                         max_SamplingInterval, int){
+  
+  # from the evaluation data select rows appropriately spaced
+  seq <- round(seq(min(evaldd$t),nrow(evaldd),round(SamplingInterval,2)),2)
+  eval2 <- evaldd %>%
+    mutate(t = round(t,2),
+           N = ifelse(t %in% seq,N,NA)) %>%
+    na.omit()
+  
+  val <- c(values, eval2$N) # values to use in forecast function
+  pred <- paste(length(values)+1, length(val)) # which to predict
+  
+  # which of the predicted time points to actually retain to calculate the rmse
+  actual_pred_index <- seq(min(evaldd$t),nrow(evaldd),max_SamplingInterval)
+
+  # training and forecasting
+  sim <- simplex(val, E = E, tp = tp, pred = pred, lib=lib, stats_only = F)
+  
+  # merging results and keeping only forecasted time points of interest (see above)
+  predictions <- sim$model_output[[paste0("E",E)]] %>%
+    filter(!is.nan(Observations)) %>%
+    rename(N = Observations)
+  
+  eval3 <- full_join(eval2, predictions, by="N")
+  
+  eval4 <- eval3 %>%
+    filter(t %in% round(actual_pred_index,2))
+  
+  eval5 <- eval4 %>%
+    filter(!is.nan(Predictions),
+           row_number() <= 30,
+           row_number() > 5) # so that regardless of time series length only 25 time points are used for the evaluation
+  
+  # calculation of rmse
+  rmse <- sqrt(mean((eval5$N-eval5$Predictions)^2))
+  
+  return(rmse)
+}
+```
+
+
+```{r SimulateAndForecast}
+# Function to simulate and forecast
+SimulateAndForecast <- function(model, ns, step, nruns, sds,
+                                SamplingInterval, E=NULL){
+  Forecasts <- lapply(ns, function(n){ # "loop": repeat analysis for different time series lengths (number of timepoints)
+    
+    # run the simulation
+    truth <- data.frame(model$run(seq(0,4*n-step, by = step)))
+    
+    # remove burn-in
+    truth <- truth %>%
+      filter(row_number() > min(ns/max(SamplingInterval))/step)
+
+    Forecasts <- mclapply(1:nruns,function(i){ # "loop": as I add noise I repeat the analysis "nruns" times
+      Forecasts <- lapply(sds, function(sd){ # "loop": I add different amounts of noise
+        
+        # training data
+        int1 <- round(runif(1,0,15),2)
+        run <- truth %>% 
+          filter(row_number() > int1/step, row_number() <= n/step + int1/step)  %>% ## adding some randomness of when training data starts
+          filter(row_number() <= n/step)
+        # evaluation data
+        int2 <- round(runif(1,1,16),2)
+        eval <- truth %>% 
+          filter(row_number() > (int1+int2)/step + n/step) %>% # adding some randomness of when the evaluation dataset starts
+          filter(row_number() <= nrow(run))
+        
+        if(sd==0 & i>1) return() # with no noise no need to repeat
+        
+        run$N.noise <- run$N + rtruncnorm(1, a = -(run$N-1), mean=0, sd = sd) # add noise to training dataset
+        
+        for(j in 1:length(SamplingInterval)){ # create subsampling
+          run <- run %>%
+            mutate(t = round(t,2),
+                   !!paste(SamplingInterval[j]) := ifelse(t %in% round(seq(min(run$t),max(run$t),SamplingInterval[j]),2),
+                                                                  N.noise,NA))
+        }
+        
+        runLong <- run %>% # changing to long format
+          select(-Nlag, -N.noise, -N) %>%
+          pivot_longer(cols = -t, names_to = "SamplingInterval") %>%
+          na.omit()
+        
+        length <- min(table(runLong$SamplingInterval)) # minimal number of time points 
+        
+        runLongReduced <- runLong %>% # make all timeseries have the same number of time points regardless of sampling
+          group_by(SamplingInterval) %>%
+          filter(row_number() <= length) %>%
+          mutate(n=n()) %>%
+          ungroup() %>%
+          mutate(SamplingInterval = as.numeric(SamplingInterval),
+                 ts = max(SamplingInterval)/SamplingInterval,
+                 sd = sd)
+        
+        max_SamplingInterval <- max(SamplingInterval)
+        
+        runLongReduced2 <- runLongReduced %>% # the simplex forecasting is done here using a wrapper function
+          group_by(SamplingInterval,sd,n,ts) %>%
+          summarize(lib = paste(1, n()),
+                    pred = lib,
+                    E = ifelse(is.null(E),decideE(value,lib,pred),E),
+                    rmse = simplex_wrap(value, lib, E, unique(ts), eval,
+                                        unique(SamplingInterval), max_SamplingInterval, int),
+                    mean = mean(value),
+                    sd_ts = sd(value),
+                    rmse.norm = rmse/sd_ts,
+                    int1 =int1,
+                    int2=int2
+          ) 
+        
+        runLongReduced2
+      })
+      
+      Forecasts <- do.call("rbind",Forecasts) %>%
+        mutate(run = i)
+    }, mc.cores = detectCores()-2)
+    
+    Forecasts <- do.call("rbind",Forecasts)
+  })
+  
+  Forecasts <- do.call("rbind",Forecasts)
+  return(Forecasts)
+}
+```
+
+## Simulations
+
+```{r sim_prep}
+growth_rates <- seq(0.3,1.2,0.1)
+
+taus <- round(2.3/growth_rates,2)
+SamplingInterval <- c(0.5,1,2,4,8)
+
+sds <- seq(30,90,30)
+nruns <- 100
+step <- 0.01
+
+adjusted15 <- ceiling(15 * max(SamplingInterval))
+ns <- seq(adjusted15*3,adjusted15*7,adjusted15)
+```
+
+```{r run_ForecastsOptE, eval=FALSE}
+set.seed(222)
+
+ForecastsOptE <- lapply(1:length(growth_rates), function(j){
+  
+  growth_rate <- growth_rates[j]
+  tau <- taus[j]
+  model <- gen$new(r = growth_rate, N_ini=800, tau=tau, K=500)
+  
+  ForecastsOptE <- SimulateAndForecast(model, ns, step, nruns, sds, SamplingInterval, E=NULL)
+  
+  ForecastsOptE <- ForecastsOptE %>%
+    mutate(growth_rate = growth_rate,
+           tau=tau,
+           r_times_tau = round(tau*growth_rate,2))
+  
+  ForecastsOptE
+
+})
+
+ForecastsOptE <- do.call("rbind",ForecastsOptE)
+write_csv(ForecastsOptE, here("Data/SimulationsForecastVsGrowthRate/ForecastsOptE.csv"))
+```
+
+
+# Forecasting
+
+## Complete data, 47-fold (Evaluation time points set to 21)
+
+```{r GREForecastDaily_prep, message=FALSE, warning=FALSE, cache=TRUE}
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+possible_predictors <- c(targets, "mean_epi_temp", "mean_mixed_layer_depth", "ml_irradiance", "ammonium", "nitrate", "phosphate")
+ 
+ddHF_GRE2 <- ddHF_GRE2 %>% ungroup() 
+set.seed(1)
+which <- length(possible_predictors)
+predictor_combinations <- predictor_combinator(possible_predictors, which=which,
+                                               temperature.included = F, rmTfrompred = F)
+ks <- unique(round(exp(seq(log(0.8),log(ceiling(.75*nrow(ddHF_GRE2))),length.out = 49))))
+libraries <- K_fold_libraries(data = ddHF_GRE2, step = 60)
+lib <- libraries$lib
+pred <- libraries$pred
+```
+
+
+### 1 step ahead
+
+```{r GREForecastDaily1step_47fold, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+libraries2 <- K_fold_libraries(data = ddHF_GRE2, step = 21)
+lib2 <- libraries2$lib[-length(libraries2$pred)]
+pred2 <- libraries2$pred[-length(libraries2$pred)]
+
+write.file = 'R_prog_fore_fulldaily_1step_47fold.txt'
+file.create(write.file)
+
+GREForecastDaily1step47fold <- lapply(1:length(pred2), function(i){
+  write(paste0("Fold number: ", i, " out of ", length(pred2)), write.file, append = T)
+  df <- model_fitter_wrapper(whole.data = ddHF_GRE2,
+                             predictor_combinations = predictor_combinations,
+                             targets = targets,
+                             lib = lib2[[i]], pred = pred2[[i]],
+                             num.clusters = detectCores() - 1,
+                             E = 2, max_lag = 3, k=ks, Tp = 1,
+                             predictors = possible_predictors, 
+                             write.file = write.file)
+  df$fold <- i
+  df
+})
+
+GREForecastDaily1step47fold <- do.call("rbind", GREForecastDaily1step47fold)
+
+save(GREForecastDaily1step47fold, file = here("Data/forecast_data/GREForecastDaily1step47fold.RData"))
+```
+
+
+### 12 steps ahead
+
+```{r GREForecastDaily12steps_47fold, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+libraries2 <- K_fold_libraries(data = ddHF_GRE2, step = 21)
+lib2 <- libraries2$lib[-length(libraries2$pred)]
+pred2 <- libraries2$pred[-length(libraries2$pred)]
+
+write.file = 'R_prog_fore_fulldaily_12steps_47fold.txt'
+file.create(write.file)
+
+GREForecastDaily12steps47fold <- lapply(1:length(pred2), function(i){
+  write(paste0("Fold number: ", i, " out of ", length(pred2)), write.file, append = T)
+  df <- model_fitter_wrapper(whole.data = ddHF_GRE2,
+                             predictor_combinations = predictor_combinations,
+                             targets = targets,
+                             lib = lib2[[i]], pred = pred2[[i]],
+                             num.clusters = detectCores() - 1,
+                             E = 2, max_lag = 3, k=ks, Tp = 12,
+                             predictors = possible_predictors, 
+                             write.file = write.file)
+  df$fold <- i
+  df
+})
+
+GREForecastDaily12steps47fold <- do.call("rbind", GREForecastDaily12steps47fold)
+
+save(GREForecastDaily12steps47fold, file = here("Data/forecast_data/GREForecastDaily12steps47fold.RData"))
+```
+
+
+
+## Reduced sampling frequency (LOOCV)
+
+```{r subsample_prep, message=FALSE, warning=FALSE, cache=TRUE}
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+possible_predictors <- c(targets, "mean_epi_temp", "mean_mixed_layer_depth", "ml_irradiance", "ammonium", "nitrate", "phosphate")
+which <- length(possible_predictors)
+predictor_combinations <- predictor_combinator(possible_predictors, which=which,
+                                               temperature.included = F, rmTfrompred = F)
+```
+
+
+
+### Daily sampling, 12 steps ahead
+
+
+```{r GREForecastDaily_subsample1day12steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_1day_12steps.txt'
+file.create(write.file)
+
+GREForecastDaily_subsample1day12steps <- lapply(1:length(ddHF_GRE2_1day), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_1day)), write.file, append = T)
+  dd <- forecasting_loocv(data = ddHF_GRE2_1day[[i]], steps_ahead = 12, lib_step = 21, 
+                          E = 2, predictors = possible_predictors, 
+                          pred_combs = predictor_combinations, 
+                          targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GREForecastDaily_subsample1day12steps <- do.call("rbind", GREForecastDaily_subsample1day12steps)
+
+save(GREForecastDaily_subsample1day12steps, file = here("Data/forecast_data/GREForecastDaily_subsample1day12steps.RData"))
+```
+
+
+
+### 3 days sampling interval, 4 steps ahead
+
+```{r GREForecastDaily_subsample3days4steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_3days_4steps.txt'
+file.create(write.file)
+
+GREForecastDaily_subsample3days4steps <- lapply(1:length(ddHF_GRE2_3days), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_3days)), write.file, append = T)
+  dd <- forecasting_loocv(data = ddHF_GRE2_3days[[i]], steps_ahead = 4, lib_step = 21, 
+                          E = 2, predictors = possible_predictors, 
+                          pred_combs = predictor_combinations, 
+                          targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GREForecastDaily_subsample3days4steps <- do.call("rbind", GREForecastDaily_subsample3days4steps)
+
+save(GREForecastDaily_subsample3days4steps, file = here("Data/forecast_data/GREForecastDaily_subsample3days4steps.RData"))
+```
+
+### 6 days sampling interval, 2 steps ahead
+
+```{r GREForecastDaily_subsample6days2steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_6days_2steps.txt'
+file.create(write.file)
+
+GREForecastDaily_subsample6days2steps <- lapply(1:length(ddHF_GRE2_6days), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_6days)), write.file, append = T)
+  dd <- forecasting_loocv(data = ddHF_GRE2_6days[[i]], steps_ahead = 2, lib_step = 21, 
+                          E = 2, predictors = possible_predictors, 
+                          pred_combs = predictor_combinations, 
+                          targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GREForecastDaily_subsample6days2steps <- do.call("rbind", GREForecastDaily_subsample6days2steps)
+
+save(GREForecastDaily_subsample6days2steps, file = here("Data/forecast_data/GREForecastDaily_subsample6days2steps.RData"))
+```
+
+### 12 days sampling interval, 1 step ahead
+
+```{r GREForecastDaily_subsample12days1step, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_12day_1step.txt'
+file.create(write.file)
+
+GREForecastDaily_subsample12days1step <- lapply(1:length(ddHF_GRE2_12days), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_12days)), write.file, append = T)
+  dd <- forecasting_loocv(data = ddHF_GRE2_12days[[i]], steps_ahead = 1, lib_step = 21, 
+                          E = 2, predictors = possible_predictors, 
+                          pred_combs = predictor_combinations, 
+                          targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GREForecastDaily_subsample12days1step <- do.call("rbind", GREForecastDaily_subsample12days1step)
+
+save(GREForecastDaily_subsample12days1step, file = here("Data/forecast_data/GREForecastDaily_subsample12days1step.RData"))
+```
+
+
+
+## Reduced time points forecasting
+
+```{r subsample_prep2, message=FALSE, warning=FALSE, cache=TRUE}
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+possible_predictors <- c(targets, "mean_epi_temp", "mean_mixed_layer_depth", "ml_irradiance", "ammonium", "nitrate", "phosphate")
+which <- length(possible_predictors)
+predictor_combinations <- predictor_combinator(possible_predictors, which=which,
+                                               temperature.included = F, rmTfrompred = F)
+```
+
+
+### 75% of time points, 12-steps ahead, 35-fold (Evaluation time points set to 21)
+
+```{r GREForecastDaily_75perc35fold12steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_75perc35fold12steps.txt'
+file.create(write.file)
+
+GREForecastDaily_perc75fold35steps12 <- lapply(1:length(ddHF_GRE2_75perc), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_75perc)), write.file, append = T)
+  dd <- forecasting(data = ddHF_GRE2_75perc[[i]], steps_ahead = 12, 
+                    lib_step = 21, removeLast = T,
+                    E = 2, predictors = possible_predictors, length.out = 50,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd <- dd %>%
+    dplyr::rename(fold=forecast_subrun)
+  dd
+}) 
+
+GREForecastDaily_perc75fold35steps12 <- do.call("rbind", GREForecastDaily_perc75fold35steps12)
+
+save(GREForecastDaily_perc75fold35steps12, file = here("Data/forecast_data/GREForecastDaily_perc75fold35steps12.RData"))
+```
+
+### 50% of time points,  12-steps ahead, 23-fold (Evaluation time points set to 21)
+
+```{r GREForecastDaily_50perc23fold12steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_50perc23fold12steps.txt'
+file.create(write.file)
+
+GREForecastDaily_perc50fold23steps12 <- lapply(1:length(ddHF_GRE2_50perc), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_50perc)), write.file, append = T)
+  dd <- forecasting(data = ddHF_GRE2_50perc[[i]], steps_ahead = 12,
+                    lib_step = 21, removeLast = T,
+                    E = 2, predictors = possible_predictors, length.out = 52,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd <- dd %>%
+    dplyr::rename(fold=forecast_subrun)
+  dd
+}) 
+
+GREForecastDaily_perc50fold23steps12 <- do.call("rbind", GREForecastDaily_perc50fold23steps12)
+
+save(GREForecastDaily_perc50fold23steps12, file = here("Data/forecast_data/GREForecastDaily_perc50fold23steps12.RData"))
+```
+
+### 25% of time points, 12-step ahead, 12-fold  (Evaluation time points set to 21)
+
+```{r GREForecastDaily_25perc12fold12steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_25perc12fold12steps.txt'
+file.create(write.file)
+
+GREForecastDaily_perc25fold12steps12 <- lapply(1:length(ddHF_GRE2_25perc), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_25perc)), write.file, append = T)
+  dd <- forecasting(data = ddHF_GRE2_25perc[[i]], steps_ahead = 12, 
+                    lib_step = 21, 
+                    E = 2, predictors = possible_predictors, length.out = 56,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd <- dd %>%
+    dplyr::rename(fold=forecast_subrun)
+  dd
+}) 
+
+GREForecastDaily_perc25fold12steps12 <- do.call("rbind", GREForecastDaily_perc25fold12steps12)
+
+save(GREForecastDaily_perc25fold12steps12, file = here("Data/forecast_data/GREForecastDaily_perc25fold12steps12.RData"))
+```
+
+### 16.7% of time points,  12-step ahead, 8-fold  (Evaluation time points set to 21)
+
+```{r GREForecastDaily_16.7percfold8steps12, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_16.7percfold8steps12.txt'
+file.create(write.file)
+
+GREForecastDaily_perc16.7fold8steps12 <- lapply(1:length(ddHF_GRE2_16.7perc), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_16.7perc)), write.file, append = T)
+  dd <- forecasting(data = ddHF_GRE2_16.7perc[[i]], steps_ahead = 12,
+                    lib_step = 21, 
+                    E = 2, predictors = possible_predictors, length.out = 62,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd <- dd %>%
+    dplyr::rename(fold=forecast_subrun)
+  dd
+}) 
+
+GREForecastDaily_perc16.7fold8steps12 <- do.call("rbind", GREForecastDaily_perc16.7fold8steps12)
+
+save(GREForecastDaily_perc16.7fold8steps12, file = here("Data/forecast_data/GREForecastDaily_perc16.7fold8steps12.RData"))
+```
+
+### 8.3% of time points,  12-step ahead, 4-fold  (Evaluation time points set to 21)
+
+```{r GREForecastDaily_8.3percfold4steps12, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_8.3percfold1712steps.txt'
+file.create(write.file)
+
+GREForecastDaily_perc8.3fold4steps12 <- lapply(1:length(ddHF_GRE2_1day), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_1day)), write.file, append = T)
+  dd <- forecasting(data = ddHF_GRE2_1day[[i]], steps_ahead = 12,
+                    lib_step = 21, 
+                    E = 2, predictors = possible_predictors, length.out = 80,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd <- dd %>%
+    dplyr::rename(fold=forecast_subrun)
+  dd
+}) 
+
+GREForecastDaily_perc8.3fold4steps12 <- do.call("rbind", GREForecastDaily_perc8.3fold4steps12)
+
+save(GREForecastDaily_perc8.3fold4steps12, file = here("Data/forecast_data/GREForecastDaily_perc8.3fold4steps12.RData"))
+```
+
+
+
+## Load in results
+
+```{r load_forecasts, message=FALSE, warning=FALSE}
+#### complete data, 47-fold
+load(here("Data/forecast_data/GREForecastDaily12steps47fold.RData")) # for RMSE ~ time ahead
+load(here("Data/forecast_data/GREForecastDaily1step47fold.RData")) # for chp1 1 step
+
+### Reduced sampling interval, LOOCV, 12 days ahead
+
+load(here("Data/forecast_data/GREForecastDaily_subsample1day12steps.RData"))
+load(here("Data/forecast_data/GREForecastDaily_subsample3days4steps.RData"))
+load(here("Data/forecast_data/GREForecastDaily_subsample6days2steps.RData"))
+load(here("Data/forecast_data/GREForecastDaily_subsample12days1step.RData"))
+
+### Reduced time points, variable-fold (21 tp evaluation data), daily data, 12 steps ahead
+
+load(here("Data/forecast_data/GREForecastDaily_perc75fold35steps12.RData"))
+load(here("Data/forecast_data/GREForecastDaily_perc50fold23steps12.RData"))
+load(here("Data/forecast_data/GREForecastDaily_perc25fold12steps12.RData"))
+load(here("Data/forecast_data/GREForecastDaily_perc16.7fold8steps12.RData"))
+load(here("Data/forecast_data/GREForecastDaily_perc8.3fold4steps12.RData"))
+```
+
+
+### Forecast data prep
+
+```{r forecast_data_prep}
+### Full data 
+
+GREForecastDaily12steps47fold <- GREForecastDaily12steps47fold %>%
+  dplyr::mutate(Lake = "Greifensee", Sampling = "Daily", step=12) %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step)
+
+GREForecastDaily1step47fold <- GREForecastDaily1step47fold %>%
+  dplyr::mutate(Lake = "Greifensee", Sampling = "Daily", step=1) %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step)
+
+FullForecasts <- GREForecastDaily12steps47fold
+
+FullForecastsSumm <- FullForecasts %>%
+  group_by(Lake, Target, predictor_combination, num_pred, target_excluded, Sampling, step) %>%
+  summarize(meanRMSE=mean(RMSE),
+            sdRMSE=sd(RMSE),
+            medianRMSE=median(RMSE),
+            iqrRMSE=IQR(RMSE))
+
+FullForecastsSummstep1 <- GREForecastDaily1step47fold %>%
+  group_by(Lake, Target, predictor_combination, num_pred, target_excluded, Sampling, step) %>%
+  summarize(meanRMSE=mean(RMSE),
+            sdRMSE=sd(RMSE),
+            medianRMSE=median(RMSE),
+            iqrRMSE=IQR(RMSE))
+
+##############
+
+### Sub-sampled forecasting (4-fold)
+
+GREForecastDaily_subsample1day12steps <- GREForecastDaily_subsample1day12steps %>%
+  dplyr::mutate(subsampleinterval = "1 day", data = "Reduced", step=12)
+
+GREForecastDaily_subsample3days4steps <- GREForecastDaily_subsample3days4steps %>%
+  dplyr::mutate(subsampleinterval = "3 days", data = "Reduced", step=4) 
+
+GREForecastDaily_subsample6days2steps <- GREForecastDaily_subsample6days2steps %>%
+  dplyr::mutate(subsampleinterval = "6 days", data = "Reduced", step=2) 
+
+GREForecastDaily_subsample12days1step <- GREForecastDaily_subsample12days1step %>%
+  dplyr::mutate(subsampleinterval = "12 days", data = "Reduced", step=1) 
+
+ForecastsSubsample <- rbind(GREForecastDaily_subsample1day12steps,
+                            GREForecastDaily_subsample3days4steps,
+                            GREForecastDaily_subsample6days2steps,
+                            GREForecastDaily_subsample12days1step)
+
+ForecastsSummSubsample <- ForecastsSubsample %>%
+  group_by(subsampleinterval, Target, step) %>%
+  summarize(medianRMSE = median(RMSE),
+            meanRMSE = mean(RMSE)) %>%
+  mutate(subsampleinterval = factor(subsampleinterval, ordered = T, levels = c("1 day","3 days","6 days","12 days")))
+
+
+##############
+
+### Reduced number of time points
+
+GREForecastDaily12steps47fold <- GREForecastDaily12steps47fold %>%
+  dplyr::mutate(percentData=100, subsample=1)
+
+GREForecastDaily_perc75fold35steps12 <- GREForecastDaily_perc75fold35steps12 %>%
+  dplyr::mutate(Sampling = "Daily", step=12, percentData=75, Lake="Greifensee") %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step, percentData, subsample)
+
+GREForecastDaily_perc50fold23steps12 <- GREForecastDaily_perc50fold23steps12 %>%
+  dplyr::mutate(Sampling = "Daily", step=12, percentData=50, Lake="Greifensee") %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step, percentData, subsample)
+
+GREForecastDaily_perc25fold12steps12 <- GREForecastDaily_perc25fold12steps12 %>%
+  dplyr::mutate(Sampling = "Daily", step=12, percentData=25, Lake="Greifensee") %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step, percentData, subsample)
+
+GREForecastDaily_perc16.7fold8steps12 <- GREForecastDaily_perc16.7fold8steps12 %>%
+  dplyr::mutate(Sampling = "Daily", step=12, percentData=16.7, Lake="Greifensee") %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step, percentData, subsample)
+
+GREForecastDaily_perc8.3fold4steps12 <- GREForecastDaily_perc8.3fold4steps12 %>%
+  dplyr::mutate(Sampling = "Daily", step=12, percentData=8.3, Lake="Greifensee") %>%
+  dplyr::select(Target,predictor_combination,Sampling,
+                num_pred,target_excluded,RMSE,k,fold,Lake,step, percentData, subsample)
+
+ForecastsReducedTimePoints <- rbind(GREForecastDaily12steps47fold,
+                                    GREForecastDaily_perc75fold35steps12,
+                                    GREForecastDaily_perc50fold23steps12,
+                                    GREForecastDaily_perc25fold12steps12,
+                                    GREForecastDaily_perc16.7fold8steps12,
+                                    GREForecastDaily_perc8.3fold4steps12)
+
+ForecastsSummReducedTimePoints <- ForecastsReducedTimePoints %>%
+  group_by(percentData, Target, subsample, step) %>%
+  summarize(medianRMSE = median(RMSE),
+            meanRMSE = mean(RMSE)) %>%
+  group_by(percentData, Target, step) %>%
+  summarize(medianmedianRMSE = median(medianRMSE),
+            meanmeanRMSE = mean(meanRMSE),
+            minmeanRMSE = min(meanRMSE),
+            minmedianRMSE = min(medianRMSE))
+```
+
+
+
+# Estimation of causal links
+
+## Complete data
+
+```{r determine_numb_interactions_GRE_daily_prep, message=FALSE, warning=FALSE}
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+interactors <- c(targets, "mean_epi_temp", "mean_mixed_layer_depth", "ml_irradiance", "ammonium", "nitrate", "phosphate")
+```
+
+
+```{r determine_numb_interactions_GRE_daily, message=FALSE, warning=FALSE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily <- numberInteractions(data = ddHF_GRE2, libsize = nrow(ddHF_GRE2), 
+                                                step = 75, maxlag = NULL, lag.test = F,  lmin = lmin, lmax = lmax,
+                                                maxE = 9, targets = targets, interactors = interactors, 
+                                                surrogateMethod = "seasonal", T_period = 365)
+
+ccm_interactionsGREDaily <- ccm_interactionsGREDaily$ccm_interactions
+
+save(ccm_interactionsGREDaily, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily.RData"))
+```
+
+
+## Reduced sampling frequency
+
+### Daily sampling, reduced data
+
+```{r determine_numb_interactions_GRE_daily_subsample1day, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_subsample1day <- lapply(1:length(ddHF_GRE2_1day), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_1day[[i]], libsize = nrow(ddHF_GRE2_1day[[i]]), 
+                             step = 10, maxlag = NULL, maxE = 9, targets = targets, lag.test = F,
+                             interactors = interactors, surrogateMethod = "seasonal", T_period = 365)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_subsample1day <- do.call("rbind", ccm_interactionsGREDaily_subsample1day)
+
+save(ccm_interactionsGREDaily_subsample1day, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample1day.RData"))
+```
+
+### Every 3 days sampling, reduced data
+
+```{r determine_numb_interactions_GRE_daily_subsample3days, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_subsample3days <- lapply(1:length(ddHF_GRE2_3days), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_3days[[i]], libsize = nrow(ddHF_GRE2_3days[[i]]), 
+                             step = 10, maxlag = NULL, maxE = 9, targets = targets, lag.test = F,
+                             interactors = interactors, surrogateMethod = "seasonal", T_period = 122)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_subsample3days <- do.call("rbind", ccm_interactionsGREDaily_subsample3days)
+
+save(ccm_interactionsGREDaily_subsample3days, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample3days.RData"))
+```
+
+### Every 6 days sampling, reduced data
+
+```{r determine_numb_interactions_GRE_daily_subsample6days, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_subsample6days <- lapply(1:length(ddHF_GRE2_6days), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_6days[[i]], libsize = nrow(ddHF_GRE2_6days[[i]]), 
+                           step = 10, maxlag = NULL, maxE = 9, targets = targets, lag.test = F,
+                           interactors = interactors, surrogateMethod = "seasonal", T_period = 61)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_subsample6days <- do.call("rbind", ccm_interactionsGREDaily_subsample6days)
+
+save(ccm_interactionsGREDaily_subsample6days, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample6days.RData"))
+```
+
+### Every 12 days sampling, reduced data
+
+```{r determine_numb_interactions_GRE_daily_subsample12days, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_subsample12days <- lapply(1:length(ddHF_GRE2_12days), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_12days[[i]], libsize = nrow(ddHF_GRE2_12days[[i]]), 
+                           step = 10, maxlag = NULL, maxE = 9, targets = targets, lag.test = F,
+                           interactors = interactors, surrogateMethod = "seasonal", T_period = 30)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_subsample12days <- do.call("rbind", ccm_interactionsGREDaily_subsample12days)
+
+save(ccm_interactionsGREDaily_subsample12days, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample12days.RData"))
+```
+
+## Reduced time points estimation
+
+### 75% of time points
+
+```{r determine_numb_interactions_GRE_daily_75perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_75perc <- lapply(1:length(ddHF_GRE2_75perc), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_75perc[[i]], libsize = nrow(ddHF_GRE2_75perc[[i]]), 
+                             step = 50, maxlag = NULL, maxE = 9, targets = targets, lag.test = F, lmin = lmin, lmax = lmax,
+                             interactors = interactors, surrogateMethod = "seasonal", T_period = 365)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_75perc <- do.call("rbind", ccm_interactionsGREDaily_75perc)
+
+save(ccm_interactionsGREDaily_75perc, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_75perc.RData"))
+```
+
+### 50% of time points
+
+```{r determine_numb_interactions_GRE_daily_50perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_50perc <- lapply(1:length(ddHF_GRE2_50perc), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_50perc[[i]], libsize = nrow(ddHF_GRE2_50perc[[i]]), 
+                             step = 35, maxlag = NULL, maxE = 9, targets = targets, lag.test = F, lmin = lmin, lmax = lmax,
+                             interactors = interactors, surrogateMethod = "seasonal", T_period = 365)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_50perc <- do.call("rbind", ccm_interactionsGREDaily_50perc)
+
+save(ccm_interactionsGREDaily_50perc, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_50perc.RData"))
+```
+
+### 25% of time points
+
+```{r determine_numb_interactions_GRE_daily_25perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_25perc <- lapply(1:length(ddHF_GRE2_25perc), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_25perc[[i]], libsize = nrow(ddHF_GRE2_25perc[[i]]), 
+                             step = 17, maxlag = NULL, maxE = 9, targets = targets, lag.test = F, lmin = lmin, lmax = lmax,
+                             interactors = interactors, surrogateMethod = "seasonal", T_period = 365)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_25perc <- do.call("rbind", ccm_interactionsGREDaily_25perc)
+
+save(ccm_interactionsGREDaily_25perc, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_25perc.RData"))
+```
+
+### 16.7% of time points
+
+```{r determine_numb_interactions_GRE_daily_16.7perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(2)
+ccm_interactionsGREDaily_16.7perc <- lapply(1:length(ddHF_GRE2_16.7perc), function(i){
+  temp <- numberInteractions(data = ddHF_GRE2_16.7perc[[i]], libsize = nrow(ddHF_GRE2_16.7perc[[i]]), 
+                             step = 11, maxlag = NULL, maxE = 9, targets = targets, lag.test = F, lmin = lmin, lmax = lmax,
+                             interactors = interactors, surrogateMethod = "seasonal", T_period = 365)
+  temp <- temp$ccm_interactions
+  temp$subsample <- i
+  temp
+}) 
+
+ccm_interactionsGREDaily_16.7perc <- do.call("rbind", ccm_interactionsGREDaily_16.7perc)
+
+save(ccm_interactionsGREDaily_16.7perc, file = here("Data/CCM_analysis_data/ccm_interactionsGREDaily_16.7perc.RData"))
+```
+
+### 8.3% of time points
+
+See "Daily sampling, reduced data"
+
+## Load in results
+
+```{r load_CCM, message=FALSE, warning=FALSE}
+### Daily data
+
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily.RData"))
+
+#### reduced sampling interval
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample1day.RData"))
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample3days.RData"))
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample6days.RData"))
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample12days.RData"))
+
+#### reduced time points
+
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_75perc.RData"))
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_50perc.RData"))
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_25perc.RData"))
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_16.7perc.RData"))
+```
+
+
+### Number of links data prep
+
+```{r num_links_data_prep}
+### Not sub-sampled data
+
+ccm_interactionsGREDaily <- ccm_interactionsGREDaily%>%
+  dplyr::mutate(Lake = "Greifensee", Sampling = "Daily")
+
+ccm_interactions <- ccm_interactionsGREDaily
+
+ccm_interactions_sig <- ccm_interactions %>%
+  dplyr::filter(interactor==target | convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05)
+  
+NumInt <- ccm_interactions_sig %>%
+  group_by(Lake, target, Sampling) %>%
+  summarize(NumberOfInteractions=n()) %>%
+  rename(Target = target)
+
+
+### Sub-sampled data
+
+ccm_interactionsGREDaily_subsample1day$subsampleinterval <- "1 day"
+ccm_interactionsGREDaily_subsample3days$subsampleinterval <- "3 days"
+ccm_interactionsGREDaily_subsample6days$subsampleinterval <- "6 days"
+ccm_interactionsGREDaily_subsample12days$subsampleinterval <- "12 days"
+
+ccm_interactions_subsample <- 
+  rbind(ccm_interactionsGREDaily_subsample1day,
+        ccm_interactionsGREDaily_subsample3days,
+        ccm_interactionsGREDaily_subsample6days,
+        ccm_interactionsGREDaily_subsample12days)
+
+ccm_interactions_subsample_sig <- ccm_interactions_subsample %>%
+  dplyr::filter(interactor==target | convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05)
+  
+NumInt_subsample <- ccm_interactions_subsample_sig %>%
+  group_by(subsampleinterval, target, subsample) %>%
+  summarize(NumberOfInteractions=n()) %>%
+  group_by(subsampleinterval, target) %>%
+  summarize(medianNumberOfInteractions = median(NumberOfInteractions),
+            NumberOfInteractions=mean(NumberOfInteractions)) %>%
+  rename(Target=target)
+
+### Reduced time points
+
+ccm_interactionsGREDaily_100perc <- ccm_interactionsGREDaily %>%
+  dplyr::select(-Lake, -Sampling) %>%
+  dplyr::mutate(percentData = 100, subsample=1)
+
+ccm_interactionsGREDaily_75perc$percentData = 75
+ccm_interactionsGREDaily_50perc$percentData = 50
+ccm_interactionsGREDaily_25perc$percentData = 25
+ccm_interactionsGREDaily_16.7perc$percentData = 16.7
+
+ccm_interactionsGREDaily_8.7perc <- ccm_interactionsGREDaily_subsample1day %>%
+  dplyr::select(-subsampleinterval) %>%
+  dplyr::mutate(percentData = 8.3)
+
+ccm_interactions_reduced_timepoints <- 
+  rbind(ccm_interactionsGREDaily_8.7perc,
+        ccm_interactionsGREDaily_16.7perc,
+        ccm_interactionsGREDaily_25perc,
+        ccm_interactionsGREDaily_50perc,
+        ccm_interactionsGREDaily_75perc,
+        ccm_interactionsGREDaily_100perc)
+
+ccm_interactions_reduced_timepoints_sig <- ccm_interactions_reduced_timepoints %>%
+  dplyr::filter(interactor==target | convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05)
+  
+NumInt_reduced_timepoints <- ccm_interactions_reduced_timepoints_sig %>%
+  group_by(percentData, target, subsample) %>%
+  summarize(NumberOfInteractions=n()) %>%
+  group_by(percentData, target) %>%
+  summarize(medianNumberOfInteractions = median(NumberOfInteractions),
+            NumberOfInteractions=mean(NumberOfInteractions)) %>%
+  rename(Target=target)
+```
+
+# Estimation of interaction strengths
+
+```{r RegSmapPrep, , message=FALSE, warning=FALSE}
+thetas <- c(0.01, 0.1, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 9)
+lambdas <- logspace(-3,0,30)
+```
+
+## Complete data
+
+ELNET0.9
+
+```{r GreRegSmapDaily_prep, message=FALSE, warning=FALSE}
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+interactors <- c(targets, "mean_epi_temp", "mean_mixed_layer_depth", "ml_irradiance", "ammonium", "nitrate", "phosphate")
+
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily.RData"))
+
+ccm_interactionsGREdaily_sig <- ccm_interactionsGREDaily %>%
+  dplyr::filter(interactor==target | (convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05))
+```
+
+```{r GreRegSmapDaily, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdaily <- LakeInteractions(ddHF_GRE2, targets, 1, detectCores()-1, T, "RegSMap", 
+                                         ccm_interactionsGREdaily_sig, "Exponential.Kernel", thetas, lambdas,
+                                         ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+
+InteractionsGREdaily_elnet0_9 <- InteractionsGREdaily$ELNET0.9
+save(InteractionsGREdaily_elnet0_9, file = here("Data/SMap_interaction_data/InteractionsGREdaily_elnet0_9.RData"))
+```
+
+## Sub-sampled estimation
+
+### Daily sampling, reduced data, ELNET0.9 
+
+```{r daily_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample1day.RData"))
+
+ccm_interactionsGREDaily_subsample1day <- split(ccm_interactionsGREDaily_subsample1day,
+                                                 f=ccm_interactionsGREDaily_subsample1day$subsample)
+```
+
+
+```{r GreRegSmapDailyWithoutLagTest_subsample1day, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdailyWithoutLagTest_subsample1day <- lapply(1:length(ddHF_GRE2_1day), function(i){
+  ccm_interactionsGREdaily_sig <- ccm_interactionsGREDaily_subsample1day[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 &  skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_1day[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREdaily_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdailyWithoutLagTest_subsample1day <- do.call("rbind", InteractionsGREdailyWithoutLagTest_subsample1day)
+save(InteractionsGREdailyWithoutLagTest_subsample1day, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample1day.RData"))
+```
+
+### Every 3 days sampling, reduced data, ELNET0.9
+
+```{r every_3_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample3days.RData"))
+
+ccm_interactionsGREDaily_subsample3days <- split(ccm_interactionsGREDaily_subsample3days,
+                                                 f=ccm_interactionsGREDaily_subsample3days$subsample)
+```
+
+
+```{r GreRegSmapDailyWithoutLagTest_subsample3days, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdailyWithoutLagTest_subsample3days <- lapply(1:length(ddHF_GRE2_3days), function(i){
+  ccm_interactionsGREdaily_sig <- ccm_interactionsGREDaily_subsample3days[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_3days[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREdaily_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdailyWithoutLagTest_subsample3days <- do.call("rbind", InteractionsGREdailyWithoutLagTest_subsample3days)
+save(InteractionsGREdailyWithoutLagTest_subsample3days, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample3days.RData"))
+```
+
+### Every 6 days sampling, reduced data, ELNET0.9
+
+```{r every_6_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample6days.RData"))
+
+ccm_interactionsGREDaily_subsample6days <- split(ccm_interactionsGREDaily_subsample6days,
+                                                 f=ccm_interactionsGREDaily_subsample6days$subsample)
+```
+
+
+```{r GreRegSmapDailyWithoutLagTest_subsample6days, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdailyWithoutLagTest_subsample6days <- lapply(1:length(ddHF_GRE2_6days), function(i){
+  ccm_interactionsGREdaily_sig <- ccm_interactionsGREDaily_subsample6days[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_6days[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREdaily_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdailyWithoutLagTest_subsample6days <- do.call("rbind", InteractionsGREdailyWithoutLagTest_subsample6days)
+save(InteractionsGREdailyWithoutLagTest_subsample6days, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample6days.RData"))
+```
+
+### Every 12 days sampling, reduced data, ELNET0.9
+
+```{r every_12_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_subsample12days.RData"))
+
+ccm_interactionsGREDaily_subsample12days <- split(ccm_interactionsGREDaily_subsample12days,
+                                                 f=ccm_interactionsGREDaily_subsample12days$subsample)
+```
+
+
+```{r GreRegSmapDailyWithoutLagTest_subsample12days, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdailyWithoutLagTest_subsample12days <- lapply(1:length(ddHF_GRE2_12days), function(i){
+  ccm_interactionsGREdaily_sig <- ccm_interactionsGREDaily_subsample12days[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 & skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_12days[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREdaily_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdailyWithoutLagTest_subsample12days <- do.call("rbind", InteractionsGREdailyWithoutLagTest_subsample12days)
+save(InteractionsGREdailyWithoutLagTest_subsample12days, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample12days.RData"))
+```
+
+## Reduced time points estimation
+
+### 75% of time points, ELNET0.9
+
+```{r perc75_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_75perc.RData"))
+
+ccm_interactionsGREDaily_75perc <- split(ccm_interactionsGREDaily_75perc,
+                                                 f=ccm_interactionsGREDaily_75perc$subsample)
+```
+
+
+```{r GreRegSmapDaily_75perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdaily_75perc <- lapply(1:length(ddHF_GRE2_75perc), function(i){
+  ccm_interactionsGREDaily_75perc_sig <- ccm_interactionsGREDaily_75perc[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 &  skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_75perc[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREDaily_75perc_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdaily_75perc <- do.call("rbind", InteractionsGREdaily_75perc)
+save(InteractionsGREdaily_75perc, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdaily_75perc.RData"))
+```
+
+### 50% of time points, ELNET0.9
+
+```{r perc50_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_50perc.RData"))
+
+ccm_interactionsGREDaily_50perc <- split(ccm_interactionsGREDaily_50perc,
+                                                 f=ccm_interactionsGREDaily_50perc$subsample)
+```
+
+
+```{r GreRegSmapDaily_50perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdaily_50perc <- lapply(1:length(ddHF_GRE2_50perc), function(i){
+  ccm_interactionsGREDaily_50perc_sig <- ccm_interactionsGREDaily_50perc[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 &  skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_50perc[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREDaily_50perc_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdaily_50perc <- do.call("rbind", InteractionsGREdaily_50perc)
+save(InteractionsGREdaily_50perc, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdaily_50perc.RData"))
+```
+
+### 25% of time points, ELNET0.9
+
+```{r perc25_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_25perc.RData"))
+
+ccm_interactionsGREDaily_25perc <- split(ccm_interactionsGREDaily_25perc,
+                                                 f=ccm_interactionsGREDaily_25perc$subsample)
+```
+
+```{r GreRegSmapDaily_25perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdaily_25perc <- lapply(1:length(ddHF_GRE2_25perc), function(i){
+  ccm_interactionsGREDaily_25perc_sig <- ccm_interactionsGREDaily_25perc[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 &  skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_25perc[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREDaily_25perc_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdaily_25perc <- do.call("rbind", InteractionsGREdaily_25perc)
+save(InteractionsGREdaily_25perc, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdaily_25perc.RData"))
+```
+
+### 16.7% of time points, ELNET0.9
+
+```{r perc16.7_int_prep}
+load(here("Data/CCM_analysis_data/ccm_interactionsGREDaily_16.7perc.RData"))
+
+ccm_interactionsGREDaily_16.7perc <- split(ccm_interactionsGREDaily_16.7perc,
+                                                 f=ccm_interactionsGREDaily_16.7perc$subsample)
+```
+
+```{r GreRegSmapDaily_16.7perc, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(3)
+InteractionsGREdaily_16.7perc <- lapply(1:length(ddHF_GRE2_16.7perc), function(i){
+  ccm_interactionsGREDaily_16.7perc_sig <- ccm_interactionsGREDaily_16.7perc[[i]] %>%
+    dplyr::filter(interactor==target | (convergence.pvalue < 0.05 &  skill_sign=="positive" & surrogate.pvalue<0.05))
+  
+  temp <- LakeInteractions(ddHF_GRE2_16.7perc[[i]], targets, 1, detectCores()-1, T, "RegSMap", 
+                           ccm_interactionsGREDaily_16.7perc_sig, "Exponential.Kernel", thetas, lambdas,
+                           ELNET0.9=T, ELNET0.5=F, ELNET0.1=F, Ridge=F)
+  
+  temp <- temp$ELNET0.9 %>% dplyr::mutate(subsample = i)
+  temp
+}) 
+InteractionsGREdaily_16.7perc <- do.call("rbind", InteractionsGREdaily_16.7perc)
+save(InteractionsGREdaily_16.7perc, 
+     file = here("Data/SMap_interaction_data/InteractionsGREdaily_16.7perc.RData"))
+```
+
+
+### 8.3% of time points, ELNET0.9
+
+See "Daily sampling, reduced data, ELNET0.9"
+
+## Load in results
+
+```{r load_int_results}
+# load(here("Data/SMap_interaction_data/InteractionsGREelnet0_9.RData"))
+
+load(here("Data/SMap_interaction_data/InteractionsGREdaily_elnet0_9.RData"))
+
+## reduced sampling interval
+
+load(here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample1day.RData"))
+load(here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample3days.RData"))
+load(here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample6days.RData"))
+load(here("Data/SMap_interaction_data/InteractionsGREdailyWithoutLagTest_subsample12days.RData"))
+
+## reduce time points
+
+load(here("Data/SMap_interaction_data/InteractionsGREdaily_75perc.RData"))
+load(here("Data/SMap_interaction_data/InteractionsGREdaily_50perc.RData"))
+load(here("Data/SMap_interaction_data/InteractionsGREdaily_25perc.RData"))
+load(here("Data/SMap_interaction_data/InteractionsGREdaily_16.7perc.RData"))
+```
+
+### Interaction strength data prep
+
+```{r int_strength_data_prep}
+### Not sub-sampled data
+
+#### Elnet 0.9
+
+InteractionsGREdaily_elnet0_9 <- InteractionsGREdaily_elnet0_9%>%
+  dplyr::mutate(Lake = "Greifensee", Sampling = "Daily")
+
+InteractionsElnet0_9 <- InteractionsGREdaily_elnet0_9
+
+InteractionsElnet0_9Summ <- InteractionsElnet0_9 %>%
+		dplyr::group_by(Lake,Interaction,interactor,target,Sampling) %>%
+		summarize(mean = mean(Interaction_strength),
+							mean.abs = mean(abs(Interaction_strength)),
+							median = median(Interaction_strength),
+							sd = sd(Interaction_strength),
+							iqr = IQR(Interaction_strength)) %>%
+		group_by(Lake, target, Sampling) %>%
+		rename(Target=target) %>% 
+		summarize(sum_abs_mu = sum(abs(mean)),
+							sum_mean_abs = sum(mean.abs),
+							mean_abs_mean = mean(abs(mean)),
+							mean_mean_abs = mean(mean.abs),
+							median_mean_abs = median(mean.abs)) 
+
+### Sub-sampled data
+
+## Elnet 0.9
+
+InteractionsGREdailyWithoutLagTest_subsample1day$subsampleinterval <- "1 day"
+InteractionsGREdailyWithoutLagTest_subsample3days$subsampleinterval <- "3 days"
+InteractionsGREdailyWithoutLagTest_subsample6days$subsampleinterval <- "6 days"
+InteractionsGREdailyWithoutLagTest_subsample12days$subsampleinterval <- "12 days"
+
+InteractionsElnet0_9_subsample <- rbind(InteractionsGREdailyWithoutLagTest_subsample1day,
+                                          InteractionsGREdailyWithoutLagTest_subsample3days,
+                                          InteractionsGREdailyWithoutLagTest_subsample6days,
+                                          InteractionsGREdailyWithoutLagTest_subsample12days)
+
+InteractionsElnet0_9_subsample_summ <- InteractionsElnet0_9_subsample %>%
+		dplyr::group_by(subsampleinterval,Interaction,interactor,target,subsample) %>%
+		summarize(mean = mean(Interaction_strength),
+							mean.abs = mean(abs(Interaction_strength)),
+							median = median(Interaction_strength),
+							sd = sd(Interaction_strength),
+							iqr = IQR(Interaction_strength)) %>%
+		group_by(subsampleinterval, target, subsample) %>%
+		summarize(sum_abs_mu = sum(abs(mean)),
+							sum_mean_abs = sum(mean.abs),
+							mean_abs_mean = mean(abs(mean)),
+							mean_mean_abs = mean(mean.abs),
+							median_mean_abs = median(mean.abs)) %>%
+  group_by(subsampleinterval, target) %>%
+  summarize(median_mean_mean_abs = median(mean_mean_abs),
+            median_sum_mean_abs = median(sum_mean_abs),
+            sum_abs_mu = mean(sum_abs_mu),
+            sum_mean_abs = mean(sum_mean_abs),
+            mean_abs_mean = mean(mean_abs_mean),
+            mean_mean_abs = mean(mean_mean_abs)) %>%
+  rename(Target=target) 
+
+### Reduced time points
+
+## Elnet 0.9
+
+InteractionsGREdaily_100perc <- InteractionsGREdaily_elnet0_9 %>%
+  dplyr::select(-Lake, -Sampling) %>%
+  dplyr::mutate(percentData = 100, subsample = 1)
+
+InteractionsGREdaily_75perc$percentData <- 75
+InteractionsGREdaily_50perc$percentData <- 50
+InteractionsGREdaily_25perc$percentData <- 25
+InteractionsGREdaily_16.7perc$percentData <- 16.7
+
+InteractionsGREdaily_8.3perc <- InteractionsGREdailyWithoutLagTest_subsample1day %>%
+  dplyr::select(-subsampleinterval) %>%
+  dplyr::mutate(percentData = 8.3)
+
+InteractionsElnet0_9_reduced_timepoints <- rbind(InteractionsGREdaily_100perc,
+                                                 InteractionsGREdaily_75perc,
+                                                 InteractionsGREdaily_50perc,
+                                                 InteractionsGREdaily_25perc,
+                                                 InteractionsGREdaily_16.7perc,
+                                                 InteractionsGREdaily_8.3perc)
+
+InteractionsElnet0_9_reduced_timepoints_summ <- InteractionsElnet0_9_reduced_timepoints %>%
+		dplyr::group_by(percentData,Interaction,interactor,target,subsample) %>%
+		summarize(mean = mean(Interaction_strength),
+							mean.abs = mean(abs(Interaction_strength)),
+							median = median(Interaction_strength),
+							sd = sd(Interaction_strength),
+							iqr = IQR(Interaction_strength)) %>%
+		group_by(percentData, target, subsample) %>%
+		summarize(sum_abs_mu = sum(abs(mean)),
+							sum_mean_abs = sum(mean.abs),
+							mean_abs_mean = mean(abs(mean)),
+							mean_mean_abs = mean(mean.abs),
+							median_mean_abs = median(mean.abs)) %>%
+  group_by(percentData, target) %>%
+  summarize(median_mean_mean_abs = median(mean_mean_abs),
+            median_sum_mean_abs = median(sum_mean_abs),
+            sum_abs_mu = mean(sum_abs_mu),
+            sum_mean_abs = mean(sum_mean_abs),
+            mean_abs_mean = mean(mean_abs_mean),
+            mean_mean_abs = mean(mean_mean_abs)) %>%
+  rename(Target=target) 
+```
+
+
+# Growth rates of classes
+
+```{r growth_rates, message=FALSE, warning=FALSE}
+targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
+             "daphnids","cyclopoid_copepods","calanoid_copepods",
+             "nauplii","rotifers","ciliates")
+
+generation_times <- ddHF_GRE_long3_nonstand %>%
+  dplyr::filter(name %in% targets,
+                time %in% seq(2,max(ddHF_GRE_long3_nonstand$time),1),
+                ) %>%
+  arrange(time) %>%
+  group_by(name) %>%
+  mutate(time_diff= time - dplyr::lag(time),
+         growth_rate = (value-dplyr::lag(value))/dplyr::lag(value),
+         growth_rate2 = log(value/dplyr::lag(value))/(time - dplyr::lag(time)),
+         doubling_time = log(2)/growth_rate2, 
+         generation_time = (time - dplyr::lag(time))/((1/log10(2))*log10(value/dplyr::lag(value)))) %>%
+  dplyr::filter(!is.infinite(growth_rate2), !is.nan(growth_rate2))
+
+generation_times2 <- generation_times %>%
+  dplyr::filter(growth_rate>0) %>%
+  group_by(name,group) %>%
+  dplyr::summarize(min_generation_time = min(generation_time),
+                   max_growth_rate = max(growth_rate),
+                   median_generation_time = quantile(generation_time, 0.5),
+                   median_growth_rate = quantile(growth_rate, 0.5),
+                   percentile1_generation_time = quantile(generation_time, 0.01),
+                   percentile99_growth_rate = quantile(growth_rate, 0.99),
+                   percentile5_generation_time = quantile(generation_time, 0.05),
+                   percentile95_growth_rate = quantile(growth_rate, 0.95),
+                   percentile90_growth_rate = quantile(growth_rate, 0.90),
+                   #
+                   max_growth_rate2 = unname(max(growth_rate2)),
+                   percentile99_growth_rate2 = unname(quantile(growth_rate2, 0.99)),
+                   percentile95_growth_rate2 = unname(quantile(growth_rate2, 0.95)),
+                   percentile90_growth_rate2 = unname(quantile(growth_rate2, 0.90)),
+                   min_doubling_time = unname(min(doubling_time)),
+                   percentile1_doubling_time = unname(quantile(doubling_time, 0.01)),
+                   percentile5_doubling_time = unname(quantile(doubling_time, 0.05)),
+                   #
+                   net_growth_rate = percentile90_growth_rate2)
+
+generation_times <- full_join(generation_times, Traits)
+
+generation_times2 <- full_join(generation_times2, summarized_Traits)
+```
+
+
+# Analyses
+
+## Preparations
+
+```{r AnalysesPreparations, fig.width=12, fig.height=6, message=FALSE, warning=FALSE}
+### Complete 
+
+dd <- full_join(FullForecastsSumm, NumInt)
+dd <- full_join(dd, InteractionsElnet0_9Summ)
+
+### Subsampled data
+
+dd_subsample <- left_join(ForecastsSummSubsample, NumInt_subsample) 
+dd_subsample <- full_join(dd_subsample, InteractionsElnet0_9_subsample_summ) %>%
+  dplyr::mutate(subsampleinterval = factor(subsampleinterval, ordered = T, levels = c("1 day","3 days","6 days","12 days")),
+                NumberOfInteractions = ifelse(is.na(NumberOfInteractions),0,NumberOfInteractions),
+                subsampleinterval_int = ifelse(subsampleinterval=="1 day", 1,
+                                               ifelse(subsampleinterval=="3 days", 3,
+                                                      ifelse(subsampleinterval=="6 days",6,12))),
+                freq = 1/subsampleinterval_int,
+                Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"),
+                Plankton = ifelse(Target %in% c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6"), 
+                                  "Phytoplankton", "Zooplankton"),
+                Dataset = case_when(subsampleinterval_int == 1 ~ "Sampling freq: every day",
+                                    subsampleinterval_int == 3 ~ "Sampling freq: every 3 days", 
+                                    subsampleinterval_int == 6 ~ "Sampling freq: every 6 days",
+                                    subsampleinterval_int == 12 ~ "Sampling freq: every 12 days"),
+                Dataset = factor(Dataset, levels = c("Sampling freq: every day", "Sampling freq: every 3 days", 
+                                                     "Sampling freq: every 6 days", "Sampling freq: every 12 days")))
+
+### Reduced time points
+
+dd_timepoints <- left_join(ForecastsSummReducedTimePoints, NumInt_reduced_timepoints) 
+dd_timepoints <- full_join(dd_timepoints, InteractionsElnet0_9_reduced_timepoints_summ) %>%
+  dplyr::mutate(NumberOfInteractions = ifelse(is.na(NumberOfInteractions),0,NumberOfInteractions),
+                Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"),
+                NumTimePoints = case_when(percentData == 8.3 ~ floor(994/12-21),
+                                          percentData == 16.7 ~ floor(994/6-21),
+                                          percentData == 25 ~ floor(994*3/12-21),
+                                          percentData == 50 ~ floor(994*6/12-21),
+                                          percentData == 75 ~ floor(994*9/12-21),
+                                          percentData == 100 ~ floor(994-21)),
+                propTimePoints = case_when(percentData == 8.3 ~ 1/12,
+                                           percentData == 16.7 ~ 2/12,
+                                           percentData == 25 ~ 3/12,
+                                           percentData == 50 ~ 6/12,
+                                           percentData == 75 ~ 9/12,
+                                           percentData == 100 ~ 12/12),
+                Plankton = ifelse(Target %in% c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6"), 
+                                  "Phytoplankton", "Zooplankton"),
+                log10_propTimePoints = log10(propTimePoints))
+
+### colour palettes
+
+palette <- c(brewer.pal(name="Paired", n = 12),"grey","black")
+fig4cols <- c(`Daugaard et al. (2022)` = "#bd0026", 
+              `Sampling freq: every day` = "#70AD47", `Sampling freq: every 3 days` = "#5B9BD5", 
+              `Sampling freq: every 6 days` = "#ED7D31", `Sampling freq: every 12 days` = "#FFC000")
+```
+
+### Functions
+
+```{r}
+conf_interval <- function(model, nd, response, renameResponse, cmult=1.96){
+  nd[,response] <- predict(model, nd, re.form=NA)
+  mm <- model.matrix(terms(model),nd)
+  pvar1 <- diag(mm %*% tcrossprod(vcov(model),mm))
+  nd <- nd %>%
+    dplyr::mutate(lower=!!as.name(response)-cmult*sqrt(pvar1),
+                  upper=!!as.name(response)+cmult*sqrt(pvar1),
+                  Response=renameResponse) %>%
+    dplyr::rename(fit=!!as.name(response))
+  return(nd)
+}
+
+newdat <- function(data, model, expl, Dataset, Response, glm=F, cmult=1.96){
+  if(glm==F){
+    df <- data.frame(seq(min(data[,expl]),max(data[,expl]),length.out=100))
+    colnames(df) <- expl
+    pred <- predict(model, newdata=df, interval="confidence")
+    df <- cbind(df,pred)
+    df$Dataset <- Dataset
+    df$Response <- Response
+    df$Regressor <- expl
+  } else {
+    df <- data.frame(seq(min(data[,expl]),max(data[,expl]),length.out=100))
+    colnames(df) <- expl
+    pred <- data.frame(predict(model, newdata=df, se.fit=TRUE))
+    df <- cbind(df,pred)
+    df$Dataset <- Dataset
+    df$Response <- Response
+    df$Regressor <- expl
+    df$lwr <- exp(df$fit - cmult * df$se.fit)
+    df$upr <- exp(df$fit + cmult * df$se.fit)
+  }
+  return(df)
+}
+```
+
+
+## Influence of sampling design on the detection of correlations between variables
+
+### Reduced sampling interval
+
+```{r}
+## rmse ~ num int
+
+m.rmse.numint.reduced.1day <- lm(medianRMSE ~ NumberOfInteractions, 
+                                 dd_subsample %>% dplyr::filter(subsampleinterval_int == 1))
+m.rmse.numint.reduced.3days <- lm(medianRMSE ~ NumberOfInteractions, 
+                                  dd_subsample %>% dplyr::filter(subsampleinterval_int == 3))
+m.rmse.numint.reduced.6days <- lm(medianRMSE ~ NumberOfInteractions, 
+                                  dd_subsample %>% dplyr::filter(subsampleinterval_int == 6))
+m.rmse.numint.reduced.12days <- lm(medianRMSE ~ NumberOfInteractions, 
+                                   dd_subsample %>% dplyr::filter(subsampleinterval_int == 12))
+
+## rmse ~ mean int
+
+
+m.rmse.meanint.reduced.1day <- lm(medianRMSE ~ mean_mean_abs, 
+                                  dd_subsample %>% dplyr::filter(subsampleinterval_int == 1))
+m.rmse.meanint.reduced.3days <- lm(medianRMSE ~ mean_mean_abs, 
+                                   dd_subsample %>% dplyr::filter(subsampleinterval_int == 3))
+m.rmse.meanint.reduced.6days <- lm(medianRMSE ~ mean_mean_abs, 
+                                   dd_subsample %>% dplyr::filter(subsampleinterval_int == 6))
+m.rmse.meanint.reduced.12days <- lm(medianRMSE ~ mean_mean_abs, 
+                                    dd_subsample %>% dplyr::filter(subsampleinterval_int == 12))
+
+## mean int ~ num int
+
+m.numint.meanint.reduced.1day <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                                           dd_subsample %>% dplyr::filter(subsampleinterval_int == 1))
+m.numint.meanint.reduced.3days <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                                            dd_subsample %>% dplyr::filter(subsampleinterval_int == 3))
+m.numint.meanint.reduced.6days <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                                            dd_subsample %>% dplyr::filter(subsampleinterval_int == 6))
+m.numint.meanint.reduced.12days <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                                             dd_subsample %>% dplyr::filter(subsampleinterval_int == 12))
+```
+
+```{r}
+newdat.rmse.numint <- rbind(newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 1), 
+                                   m.rmse.numint.reduced.1day, "NumberOfInteractions", "Sampling interval: 1 day", "Forecast error (RMSE)"),
+                            newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 3), 
+                                   m.rmse.numint.reduced.3days, "NumberOfInteractions", "Sampling interval: 3 days", "Forecast error (RMSE)"),
+                            newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 6), 
+                                   m.rmse.numint.reduced.6days, "NumberOfInteractions", "Sampling interval: 6 days", "Forecast error (RMSE)"),
+                            newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 12), 
+                                   m.rmse.numint.reduced.12days, "NumberOfInteractions", "Sampling interval: 12 days", "Forecast error (RMSE)"))
+
+newdat.rmse.meanint <- rbind(newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 1), 
+                                    m.rmse.meanint.reduced.1day, "mean_mean_abs", "Sampling interval: 1 day", "Forecast error (RMSE)"),
+                             newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 3), 
+                                    m.rmse.meanint.reduced.3days, "mean_mean_abs", "Sampling interval: 3 days", "Forecast error (RMSE)"),
+                             newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 6), 
+                                    m.rmse.meanint.reduced.6days, "mean_mean_abs", "Sampling interval: 6 days", "Forecast error (RMSE)"),
+                             newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 12), 
+                                    m.rmse.meanint.reduced.12days, "mean_mean_abs", "Sampling interval: 12 days", "Forecast error (RMSE)"))
+ 
+
+newdat.numint.meanint <- rbind(newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 1), 
+                                      m.numint.meanint.reduced.1day, "NumberOfInteractions", "Sampling interval: 1 day", "Mean interaction strength"),
+                               newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 3), 
+                                      m.numint.meanint.reduced.3days, "NumberOfInteractions", "Sampling interval: 3 days", "Mean interaction strength"),
+                               newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 6), 
+                                      m.numint.meanint.reduced.6days, "NumberOfInteractions", "Sampling interval: 6 days", "Mean interaction strength"),
+                               newdat(dd_subsample %>% dplyr::filter(subsampleinterval_int == 12), 
+                                      m.numint.meanint.reduced.12days, "NumberOfInteractions", "Sampling interval: 12 days", "Mean interaction strength"))
+
+newdat.fig4 <- full_join(newdat.rmse.numint, full_join(newdat.rmse.meanint, newdat.numint.meanint %>% rename(NumberOfInteractions2=NumberOfInteractions)))
+```
+
+
+```{r, fig.width=8, fig.height=4}
+dd.slopes <- data.frame(Response = rep(c("Forecast error (RMSE)","Forecast error (RMSE)","Mean interaction strength"), each=4),
+                        Regressor = rep(c("Number of interactions", "Mean interaction strength", "Number of interactions"),each=4),
+                        Dataset = rep(c("Sampling freq: every day", "Sampling freq: every 3 days", 
+                                        "Sampling freq: every 6 days", "Sampling freq: every 12 days"), times=3),
+                        estimate = c(c(coef(m.rmse.numint.reduced.1day)[2], coef(m.rmse.numint.reduced.3days)[2], 
+                                       coef(m.rmse.numint.reduced.6days)[2], coef(m.rmse.numint.reduced.12days)[2]),
+                                     c(coef(m.rmse.meanint.reduced.1day)[2], coef(m.rmse.meanint.reduced.3days)[2],
+                                       coef(m.rmse.meanint.reduced.6days)[2], coef(m.rmse.meanint.reduced.12days)[2]),
+                                     c(coef(m.numint.meanint.reduced.1day)[2], coef(m.numint.meanint.reduced.3days)[2],
+                                       coef(m.numint.meanint.reduced.6days)[2], coef(m.numint.meanint.reduced.12days)[2])),
+                        lower = c(c(confint(m.rmse.numint.reduced.1day)[2,1], confint(m.rmse.numint.reduced.3days)[2,1], 
+                                    confint(m.rmse.numint.reduced.6days)[2,1], confint(m.rmse.numint.reduced.12days)[2,1]),
+                                  c(confint(m.rmse.meanint.reduced.1day)[2,1], confint(m.rmse.meanint.reduced.3days)[2,1],
+                                    confint(m.rmse.meanint.reduced.6days)[2,1], confint(m.rmse.meanint.reduced.12days)[2,1]),
+                                  c(confint(m.numint.meanint.reduced.1day)[2,1], confint(m.numint.meanint.reduced.3days)[2,1],
+                                    confint(m.numint.meanint.reduced.6days)[2,1], confint(m.numint.meanint.reduced.12days)[2,1])),
+                        upper = c(c(confint(m.rmse.numint.reduced.1day)[2,2], confint(m.rmse.numint.reduced.3days)[2,2], 
+                                    confint(m.rmse.numint.reduced.6days)[2,2], confint(m.rmse.numint.reduced.12days)[2,2]),
+                                  c(confint(m.rmse.meanint.reduced.1day)[2,2], confint(m.rmse.meanint.reduced.3days)[2,2],
+                                    confint(m.rmse.meanint.reduced.6days)[2,2], confint(m.rmse.meanint.reduced.12days)[2,2]),
+                                  c(confint(m.numint.meanint.reduced.1day)[2,2], confint(m.numint.meanint.reduced.3days)[2,2],
+                                    confint(m.numint.meanint.reduced.6days)[2,2], confint(m.numint.meanint.reduced.12days)[2,2])))
+
+chp1 <- data.frame(Response = c("Forecast error (RMSE)","Forecast error (RMSE)","Forecast error (RMSE)","Mean interaction strength"),
+                   Regressor = c("Number of interactions", "Mean interaction strength", "Sum of interaction strengths", "Number of interactions"),
+                   Dataset = factor("Daugaard et al. (2022)"),
+                   estimate = c(-0.054,0.804,0.034,-0.053),
+                   lower = c(-0.071,0.553,-0.013,-0.064),
+                   upper= c(-0.036,1.044,0.082,-0.043))
+
+dd.slopes <- rbind(dd.slopes, chp1) %>%
+  dplyr::mutate(Dataset = factor(Dataset, levels = c("Daugaard et al. (2022)", "Sampling freq: every day", "Sampling freq: every 3 days", 
+                                                     "Sampling freq: every 6 days", "Sampling freq: every 12 days")))
+
+```
+
+
+### Reduced time points
+
+```{r}
+## rmse ~ num int
+
+m.rmse.numint.perc8.3 <- lm(medianmedianRMSE ~ NumberOfInteractions, 
+                            dd_timepoints %>% dplyr::filter(percentData == 8.3))
+m.rmse.numint.perc16.7 <- lm(medianmedianRMSE ~ NumberOfInteractions, 
+                             dd_timepoints %>% dplyr::filter(percentData == 16.7))
+m.rmse.numint.perc25 <- lm(medianmedianRMSE ~ NumberOfInteractions, 
+                           dd_timepoints %>% dplyr::filter(percentData == 25))
+m.rmse.numint.perc50 <- lm(medianmedianRMSE ~ NumberOfInteractions, 
+                           dd_timepoints %>% dplyr::filter(percentData == 50))
+m.rmse.numint.perc75 <- lm(medianmedianRMSE ~ NumberOfInteractions, 
+                           dd_timepoints %>% dplyr::filter(percentData == 75))
+m.rmse.numint.perc100 <- lm(medianmedianRMSE ~ NumberOfInteractions, 
+                            dd_timepoints %>% dplyr::filter(percentData == 100, step==12))
+
+## rmse ~ mean int
+
+m.rmse.meanint.perc8.3 <- lm(medianmedianRMSE ~ mean_mean_abs, 
+                             dd_timepoints %>% dplyr::filter(percentData == 8.3))
+m.rmse.meanint.perc16.7 <- lm(medianmedianRMSE ~ mean_mean_abs, 
+                              dd_timepoints %>% dplyr::filter(percentData == 16.7))
+m.rmse.meanint.perc25 <- lm(medianmedianRMSE ~ mean_mean_abs, 
+                            dd_timepoints %>% dplyr::filter(percentData == 25))
+m.rmse.meanint.perc50 <- lm(medianmedianRMSE ~ mean_mean_abs, 
+                            dd_timepoints %>% dplyr::filter(percentData == 50))
+m.rmse.meanint.perc75 <- lm(medianmedianRMSE ~ mean_mean_abs, 
+                            dd_timepoints %>% dplyr::filter(percentData == 75))
+m.rmse.meanint.perc100 <- lm(medianmedianRMSE ~ mean_mean_abs, 
+                             dd_timepoints %>% dplyr::filter(percentData == 100, step==12))
+
+## mean int ~ num int
+
+m.numint.meanint.perc8.3 <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                               dd_timepoints %>% dplyr::filter(percentData == 8.3))
+m.numint.meanint.perc16.7 <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                                dd_timepoints %>% dplyr::filter(percentData == 16.7))
+m.numint.meanint.perc25 <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                              dd_timepoints %>% dplyr::filter(percentData == 25))
+m.numint.meanint.perc50 <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                              dd_timepoints %>% dplyr::filter(percentData == 50))
+m.numint.meanint.perc75 <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                              dd_timepoints %>% dplyr::filter(percentData == 75))
+m.numint.meanint.perc100 <- lm(mean_mean_abs ~ NumberOfInteractions, 
+                               dd_timepoints %>% dplyr::filter(percentData == 100, step==12))
+```
+
+```{r, warning=FALSE, message=FALSE}
+percdata <- c(8.3,16.7,25,50,75,100)
+mlist1 <- list(m.rmse.numint.perc8.3, m.rmse.numint.perc16.7, m.rmse.numint.perc25,
+               m.rmse.numint.perc50, m.rmse.numint.perc75, m.rmse.numint.perc100)
+mlist2 <- list(m.rmse.meanint.perc8.3, m.rmse.meanint.perc16.7, m.rmse.meanint.perc25,
+               m.rmse.meanint.perc50, m.rmse.meanint.perc75, m.rmse.meanint.perc100)
+mlist4 <- list(m.numint.meanint.perc8.3, m.numint.meanint.perc16.7, m.numint.meanint.perc25,
+               m.numint.meanint.perc50, m.numint.meanint.perc75, m.numint.meanint.perc100)
+
+
+for(i in 1:6){
+  temp1 <- newdat(eval(mlist1[[i]]$call$data), mlist1[[i]], "NumberOfInteractions", percdata[i], "Forecast error (RMSE)")
+  temp2 <- newdat(eval(mlist1[[i]]$call$data), mlist2[[i]], "mean_mean_abs", percdata[i], "Forecast error (RMSE)")
+  temp4 <- newdat(eval(mlist1[[i]]$call$data), mlist4[[i]], "NumberOfInteractions", percdata[i], "Mean interaction strength")
+  if(i==1){
+    newdat.rmse.numint.perc <- temp1
+    newdat.rmse.meanint.perc <- temp2
+    newdat.numint.meanint.perc <- temp4
+  } else {
+    newdat.rmse.numint.perc <- rbind(newdat.rmse.numint.perc, temp1)
+    newdat.rmse.meanint.perc <- rbind(newdat.rmse.meanint.perc, temp2)
+    newdat.numint.meanint.perc <- rbind(newdat.numint.meanint.perc, temp4)
+  }
+}
+
+newdat.reduced.timepoints <- full_join(newdat.rmse.numint.perc, 
+                                       full_join(newdat.rmse.meanint.perc, newdat.numint.meanint.perc %>%
+                                                   rename(NumberOfInteractions2=NumberOfInteractions))) %>%
+  dplyr::rename(percentData = Dataset)
+```
+
+```{r}
+for(i in 1:6){
+  coef.temp1 <- coef(mlist1[[i]])[2]
+  coef.temp2 <- coef(mlist2[[i]])[2]
+  coef.temp4 <- coef(mlist4[[i]])[2]
+  
+  ci.temp1 <- confint(mlist1[[i]])
+  ci.temp2 <- confint(mlist2[[i]])
+  ci.temp4 <- confint(mlist4[[i]])
+  if(i==1){
+    coef.rmse.numint.tp <- coef.temp1
+    coef.rmse.meanint.tp <- coef.temp2
+    coef.numint.meanint.tp <- coef.temp4
+    
+    lwr.rmse.numint.tp <- ci.temp1[2,1]
+    lwr.rmse.meanint.tp <- ci.temp2[2,1]
+    lwr.numint.meanint.tp <- ci.temp4[2,1]
+    
+    upr.rmse.numint.tp <- ci.temp1[2,2]
+    upr.rmse.meanint.tp <- ci.temp2[2,2]
+    upr.numint.meanint.tp <- ci.temp4[2,2]  
+  } else {
+    coef.rmse.numint.tp <- c(coef.rmse.numint.tp, coef.temp1)
+    coef.rmse.meanint.tp <- c(coef.rmse.meanint.tp, coef.temp2)
+    coef.numint.meanint.tp <- c(coef.numint.meanint.tp, coef.temp4)
+    
+    lwr.rmse.numint.tp <- c(lwr.rmse.numint.tp, ci.temp1[2,1])
+    lwr.rmse.meanint.tp <- c(lwr.rmse.meanint.tp, ci.temp2[2,1])
+    lwr.numint.meanint.tp <- c(lwr.numint.meanint.tp, ci.temp4[2,1])
+    
+    upr.rmse.numint.tp <- c(upr.rmse.numint.tp, ci.temp1[2,2])
+    upr.rmse.meanint.tp <- c(upr.rmse.meanint.tp, ci.temp2[2,2])
+    upr.numint.meanint.tp <- c(upr.numint.meanint.tp, ci.temp4[2,2])
+  }
+}
+
+dd.slopes.tp <- data.frame(Response = rep(c("Forecast error (RMSE)","Forecast error (RMSE)","Mean interaction strength"), each=6),
+                           Regressor = rep(c("Number of interactions", "Mean interaction strength", "Number of interactions"), each=6),
+                           percentData = rep(percdata, times=3),
+                           estimate = c(coef.rmse.numint.tp, coef.rmse.meanint.tp, coef.numint.meanint.tp),
+                           lower = c(lwr.rmse.numint.tp, lwr.rmse.meanint.tp, lwr.numint.meanint.tp),
+                           upper = c(upr.rmse.numint.tp, upr.rmse.meanint.tp, upr.numint.meanint.tp))
+```
+
+
+
+## Effect of subsampling and reducing time points on forecast skill and on estimated quantities
+
+### Sub-sampling
+
+
+```{r}
+m.sampling.RMSE <- lmer(medianRMSE ~ freq*Plankton + (1+freq|Target), data = dd_subsample)
+m.sampling.NumInt <- lmer(NumberOfInteractions ~ freq*Plankton + (1+freq|Target), data = dd_subsample)
+m.sampling.MeanInt <- lmer(mean_mean_abs ~ freq*Plankton + (1+freq|Target), data = dd_subsample)
+
+newdat.sampling.freq.grid <- expand.grid(freq=seq(min(dd_subsample$freq),
+                                             max(dd_subsample$freq),
+                                             length.out = 100),
+                                    Plankton = unique(dd_subsample$Plankton))
+
+newdat.sampling.freq <- conf_interval(m.sampling.RMSE, newdat.sampling.freq.grid, "medianRMSE", "Forecast error (RMSE)")
+newdat.sampling.freq <- full_join(newdat.sampling.freq,
+                                  conf_interval(m.sampling.NumInt, newdat.sampling.freq.grid, "NumberOfInteractions", 
+                                                "Number of interactions"))
+newdat.sampling.freq <- full_join(newdat.sampling.freq,
+                                  conf_interval(m.sampling.MeanInt, newdat.sampling.freq.grid, "mean_mean_abs", 
+                                                "Mean interaction strength"))
+```
+
+
+### Reducing time points
+
+```{r}
+NumTps <- c(floor(994/12-21), floor(994/6-21), floor(994*3/12-21),
+            floor(994*6/12-21), floor(994*9/12-21), floor(994-21))
+propTps <- c(1/12,2/12,3/12,6/12,9/12,12/12)
+propTpslabs <- c("1/12","2/12","3/12","6/12","9/12","12/12")
+```
+
+
+```{r}
+m.tp.RMSE <- lmer(medianmedianRMSE ~ propTimePoints*Plankton + (1+propTimePoints|Target), data = dd_timepoints)
+m.tp.NumInt <- lmer(NumberOfInteractions ~ propTimePoints*Plankton + (1+propTimePoints|Target), data = dd_timepoints)
+m.tp.MeanInt <- lmer(mean_mean_abs ~ propTimePoints*Plankton + (1+propTimePoints|Target), data = dd_timepoints)
+
+newdat.tp <- expand.grid(propTimePoints=seq(min(dd_timepoints$propTimePoints),
+                                            max(dd_timepoints$propTimePoints),
+                                            length.out = 100),
+                         Plankton = unique(dd_timepoints$Plankton))
+
+newdat.tp2 <- conf_interval(m.tp.RMSE, newdat.tp, "medianmedianRMSE", "Forecast error (RMSE)")
+newdat.tp2 <- full_join(newdat.tp2,
+                        conf_interval(m.tp.NumInt, newdat.tp, "NumberOfInteractions", 
+                                      "Number of interactions"))
+newdat.tp2 <- full_join(newdat.tp2,
+                        conf_interval(m.tp.MeanInt, newdat.tp, "mean_mean_abs", 
+                                      "Mean interaction strength"))
+
+p2a.tp <- dd_timepoints %>%
+  ggplot(aes(propTimePoints, medianmedianRMSE)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.tp2 %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.tp2 %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+            aes(y=fit, group=Plankton), col="black") +
+  facet_wrap(~Plankton) +
+  labs(x="Number of time points", y="Forecast error (RMSE)") +
+  scale_x_continuous(breaks = NumTps) 
+
+p2b.tp <- dd_timepoints %>%
+  ggplot(aes(propTimePoints,NumberOfInteractions)) +
+  geom_point(aes(fill=Target2), 
+             position = position_jitter(0.01),
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.tp2 %>% dplyr::filter(Response=="Number of interactions"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.tp2 %>% dplyr::filter(Response=="Number of interactions"),
+            aes(y=fit, group=Plankton), col="black") +
+  facet_wrap(~Plankton) +
+  labs(x="Proportion of time points", y="Number of interactions") +
+  scale_x_continuous(breaks = propTps, labels = propTpslabs)
+
+p2c.tp <- dd_timepoints %>%
+  ggplot(aes(propTimePoints,mean_mean_abs)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.tp2 %>% dplyr::filter(Response=="Mean interaction strength"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.tp2 %>% dplyr::filter(Response=="Mean interaction strength"),
+            aes(y=fit, group=Plankton), col="black") +
+  facet_wrap(~Plankton) +
+  labs(x="Proportion of time points", y="Mean interaction strength") +
+  scale_x_continuous(breaks = propTps, labels = propTpslabs)
+```
+
+
+#### Random slopes
+
+```{r}
+m.tp.NumInt2 <- lmer(NumberOfInteractions ~ propTimePoints*Plankton + (1+propTimePoints|Target2), data = dd_timepoints)
+
+rr <- ranef(m.tp.NumInt2)  
+randomSlopes <- as.data.frame(rr)
+randomSlopes <- transform(randomSlopes, lwr = condval - 1.96*condsd, upr = condval + 1.96*condsd)
+randomSlopes <- randomSlopes %>%
+  dplyr::mutate(Parameter = ifelse(term=="(Intercept)","Random Intercept","Random slope"),
+                grp = factor(grp, levels = unique(sort(grp))))
+
+zoop <- c("calanoid_copepods","ciliates","cyclopoid_copepods","daphnids","nauplii","rotifers")
+
+ddsuppl_randomslopes2 <-
+  full_join(generation_times2, coef(m.tp.NumInt)$Target %>%
+              dplyr::mutate(name=rownames(coef(m.tp.NumInt)$Target),
+                            propTimePoints = ifelse(name %in% zoop, 
+                                                    propTimePoints+`propTimePoints:PlanktonZooplankton`,
+                                                    propTimePoints)) %>%
+              dplyr::select(NumIntSlope=propTimePoints,name))
+
+ddsuppl_randomslopes2 <-
+  full_join(ddsuppl_randomslopes2, coef(m.tp.MeanInt)$Target %>%
+              dplyr::mutate(name=rownames(coef(m.tp.MeanInt)$Target),
+                            propTimePoints = ifelse(name %in% zoop, 
+                                                    propTimePoints+`propTimePoints:PlanktonZooplankton`,
+                                                    propTimePoints)) %>%
+              dplyr::select(MeanIntSlope=propTimePoints,name))
+
+ddsuppl_randomslopes2 <- ddsuppl_randomslopes2 %>%
+  dplyr::mutate(Target2 = case_when(name == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    name == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    name == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    name == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    name == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    name == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    name == "calanoid_copepods" ~ "Calanoid copepods",
+                                    name == "ciliates" ~ "Ciliates",
+                                    name == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    name == "daphnids" ~ "Daphnids",
+                                    name == "nauplii" ~ "Nauplii",
+                                    name == "rotifers" ~ "Rotifers"))
+
+```
+
+
+#### Variance
+
+```{r}
+sd_dd_timepoints <- dd_timepoints %>%
+  group_by(propTimePoints,Plankton) %>%
+  summarize(sd_numInt = sd(NumberOfInteractions),
+            mean_numInt = mean(NumberOfInteractions))
+```
+
+
+
+## Relations between growth rates / body sizes and forecast skill/interaction estimates 
+
+```{r}
+generation_times3 <- left_join(generation_times2 %>% rename(Target=name), dd %>% dplyr::filter(step==12, Sampling=="Daily"))
+```
+
+### Growth rate
+
+```{r, message=FALSE, warning=FALSE}
+generation_times3_nolag <- generation_times3 
+
+generation_times3_nolag$log10net_growth_rate <-log10(generation_times3_nolag$net_growth_rate)
+
+m.doubling.RMSE <- lm(medianRMSE ~ log10net_growth_rate, data = generation_times3_nolag)
+m.doubling.NumInt <- glm(NumberOfInteractions ~ log10net_growth_rate, data = generation_times3_nolag, family = "quasipoisson")
+m.doubling.MeanInt <- lm(mean_mean_abs ~ log10net_growth_rate, data = generation_times3_nolag)
+
+newdat.generationtime <- newdat(generation_times3_nolag, m.doubling.RMSE, "log10net_growth_rate", NA, "Forecast error (RMSE)")
+newdat.generationtime <- full_join(newdat.generationtime,
+                                   newdat(generation_times3_nolag, m.doubling.NumInt, "log10net_growth_rate", NA, "Number of interactions", glm = T))
+newdat.generationtime <- full_join(newdat.generationtime,
+                                   newdat(generation_times3_nolag, m.doubling.MeanInt, "log10net_growth_rate", NA, "Mean interaction strength"))
+
+
+generation_times2$log10net_growth_rate <-log10(generation_times2$net_growth_rate)
+generation_times2$log10median_area <-log10(generation_times2$median_area)
+
+m.area.growthrate <- lm(log10median_area ~ log10net_growth_rate, data = generation_times2)
+newdat.area.growthrate<- newdat(generation_times2, m.area.growthrate, "log10net_growth_rate", NA, "log10(Median body area)")
+```
+
+```{r, fig.height=3, fig.width=4.5}
+generation_times3_nolag <- generation_times3_nolag %>%
+  dplyr::mutate(Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"))
+
+generation_times2 <- generation_times2 %>%
+  dplyr::mutate(Target2 = case_when(name == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    name == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    name == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    name == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    name == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    name == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    name == "calanoid_copepods" ~ "Calanoid copepods",
+                                    name == "ciliates" ~ "Ciliates",
+                                    name == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    name == "daphnids" ~ "Daphnids",
+                                    name == "nauplii" ~ "Nauplii",
+                                    name == "rotifers" ~ "Rotifers"))
+
+p3a <- generation_times3_nolag %>%
+  ggplot(aes(log10net_growth_rate,medianRMSE)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  geom_ribbon(data=newdat.generationtime %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+                aes(ymin=lwr, ymax=upr, y=fit), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.generationtime %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+                aes(y=fit), col="black")+
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y="Forecast error (RMSE)")
+
+p3b <- generation_times3_nolag %>%
+  ggplot(aes(log10net_growth_rate,NumberOfInteractions)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  geom_ribbon(data=newdat.generationtime %>% dplyr::filter(Response=="Number of interactions"),
+                aes(ymin=lwr, ymax=upr, y=fit), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.generationtime %>% dplyr::filter(Response=="Number of interactions"),
+                aes(y=exp(fit)), col="black")+
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y="Number of interactions")
+
+generation_times3_nolag2 <- generation_times3_nolag
+newdat.generationtime2 <- newdat.generationtime
+
+p3c <- generation_times3_nolag %>%
+  ggplot(aes(log10net_growth_rate,mean_mean_abs)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y="Mean interaction strength")
+
+p3e <- generation_times2 %>%
+  ggplot(aes(y=log10(median_area), x=log10(net_growth_rate)))+
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  geom_ribbon(data=newdat.area.growthrate %>% dplyr::filter(Response=="log10(Median body area)"),
+                aes(x=log10net_growth_rate, ymin=lwr, ymax=upr, y=fit), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.area.growthrate %>% dplyr::filter(Response=="log10(Median body area)"),
+                aes(x=log10net_growth_rate, y=fit), col="black")+
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y=expression(log[10](Median~body~area)~(mm^2)))+
+  theme_bw()
+```
+
+
+### Body size
+
+```{r}
+generation_times3_bodysize <- generation_times3
+
+generation_times3_bodysize$log10median_area <-log10(generation_times3_bodysize$median_area)
+
+m.area.RMSE <- lm(medianRMSE ~ log10median_area, data = generation_times3_bodysize)
+m.area.NumInt <- glm(NumberOfInteractions ~ log10median_area, data = generation_times3_bodysize, family = "quasipoisson")
+m.area.MeanInt <- lm(mean_mean_abs ~ log10median_area, data = generation_times3_bodysize)
+
+newdat.bodysize <- newdat(generation_times3_bodysize, m.area.RMSE, "log10median_area", NA, "Forecast error (RMSE)")
+newdat.bodysize <- full_join(newdat.bodysize,
+                                   newdat(generation_times3_bodysize, m.area.NumInt, "log10median_area", NA, "Number of interactions", glm = T))
+newdat.bodysize <- full_join(newdat.bodysize,
+                                   newdat(generation_times3_bodysize, m.area.MeanInt, "log10median_area", NA, "Mean interaction strength"))
+```
+
+
+
+```{r, fig.height=3, fig.width=6}
+generation_times3_bodysize <- generation_times3_bodysize %>%
+  dplyr::mutate(Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"))
+
+p3a2 <- generation_times3_bodysize %>%
+  ggplot(aes(log10median_area,medianRMSE)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  geom_ribbon(data=newdat.bodysize %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+                aes(ymin=lwr, ymax=upr, y=fit), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.bodysize %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+                aes(y=fit), col="black")+
+  labs(y="Forecast error (RMSE)",
+       x=expression(log[10](Median~body~area)~(mm^2)),
+       tag="a")
+
+p3b2 <- generation_times3_bodysize %>%
+  ggplot(aes(log10median_area,NumberOfInteractions)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  labs(y="Number of interactions",
+       x=expression(log[10](Median~body~area)~(mm^2)),
+       tag="b")
+
+
+p3c2 <- generation_times3_bodysize %>%
+  ggplot(aes(log10median_area,mean_mean_abs)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  labs(y="Mean interaction strength",
+       x=expression(log[10](Median~body~area)~(mm^2)),
+       tag="c")
+```
+
+
+# Manuscript Figures
+
+
+## Forecast figure
+
+### Simulation results
+
+```{r}
+Forecasts <- read_csv(here("Data/SimulationsForecastVsGrowthRate/ForecastsOptE.csv"))
+
+ForecastsSumm <- Forecasts %>%
+  group_by(sd,SamplingInterval,n,growth_rate,tau,r_times_tau) %>%
+  summarise(sd_rmse=sd(rmse),
+            rmse=mean(rmse),
+            median.rmse.norm = median(rmse.norm),
+            iqr.rmse.norm = IQR(rmse.norm),
+            sd_rmse.norm=sd(rmse.norm),
+            rmse.norm=mean(rmse.norm))
+
+ForecastsSummSumm <- ForecastsSumm %>%
+  group_by(n,sd,growth_rate) %>%
+  filter(rmse==min(rmse))
+
+Forecasts <- Forecasts %>%
+  group_by(n,sd,growth_rate,run) %>%
+  mutate(min_rmse = min(rmse.norm))
+
+ForecastsSumm2 <- Forecasts %>%
+  filter(rmse.norm == min_rmse)%>%
+  group_by(n,sd,growth_rate)%>%
+  summarize(sd_int=sd(SamplingInterval),
+            SamplingInterval=mean(SamplingInterval)) 
+
+simplot1 <- ForecastsSumm %>%
+  dplyr::mutate(growth_rate=round(growth_rate,2)) %>%
+  filter(sd==60, n==75, growth_rate %in% c(0.3,0.6,0.9,1.2)) %>%
+  ggplot(aes(SamplingInterval,rmse.norm,col=as.factor(growth_rate),group=as.factor(growth_rate)))+
+  geom_ribbon(aes(ymin=rmse.norm-sd_rmse.norm, ymax=rmse.norm+sd_rmse.norm, fill=as.factor(growth_rate)),col=NA,alpha=0.2)+
+  geom_line(linewidth=1.2)+
+  geom_point(aes(fill=as.factor(growth_rate), shape=as.factor(growth_rate)),size=2.3,col="black") +
+  labs(col="Growth rate",fill="Growth rate", shape="Growth rate",
+       x="Sampling interval (days)", y="Forecast error (RMSE)") +
+  scale_fill_viridis(option = "C", discrete = T, direction = -1, end = 0.85) +
+  scale_color_viridis(option = "C", discrete = T, direction = -1, end = 0.85)+ 
+  scale_shape_manual(values = c(21:25))+
+  theme_bw()+
+  theme(legend.position = "bottom")
+
+simplot2 <- ForecastsSumm2 %>%
+  filter(sd==60, n==75) %>%
+  ggplot(aes(growth_rate,SamplingInterval))+
+  geom_ribbon(aes(ymin=SamplingInterval-sd_int, ymax=SamplingInterval+sd_int),col=NA,alpha=0.2)+
+  geom_point(size=2.3) +
+  geom_line()+
+  labs(y="Optimal sampling interval (days)",
+       x="Growth rate") +
+  theme_bw()
+```
+
+### Figure 
+
+```{r, fig.height=9, fig.width=10, warning=FALSE}
+## The results of the simulations are loaded in above
+
+ForecastsSumm <- Forecasts %>%
+  dplyr::mutate(SamplingFreq = 1/SamplingInterval) %>%
+  group_by(sd,SamplingInterval,n,growth_rate,tau,r_times_tau,SamplingFreq) %>%
+  summarise(sd_rmse=sd(rmse),
+            rmse=mean(rmse),
+            median.rmse.norm = median(rmse.norm),
+            iqr.rmse.norm = IQR(rmse.norm),
+            sd_rmse.norm=sd(rmse.norm),
+            rmse.norm=mean(rmse.norm))
+
+p.a <- ForecastsSumm %>%
+  dplyr::mutate(growth_rate=round(growth_rate,2)) %>%
+  filter(sd==60, n==75, growth_rate %in% c(0.3,0.6,0.9,1.2)) %>%
+  ggplot(aes(SamplingFreq,rmse.norm,col=as.factor(growth_rate),group=as.factor(growth_rate)))+
+  geom_ribbon(aes(ymin=rmse.norm-sd_rmse.norm, ymax=rmse.norm+sd_rmse.norm, fill=as.factor(growth_rate)),col=NA,alpha=0.2)+
+  geom_line(size=1.2)+
+  geom_point(aes(fill=as.factor(growth_rate), shape=as.factor(growth_rate)),size=2.3,col="black") +
+  labs(col="Growth rate",fill="Growth rate", shape="Growth rate",
+       x="Sampling frequency (samplings/day)", y="Forecast error (RMSE)", tag="a") +
+  scale_fill_viridis(option = "C", discrete = T, direction = -1, end = 0.85) +
+  scale_color_viridis(option = "C", discrete = T, direction = -1, end = 0.85)+ 
+  scale_shape_manual(values = c(21:25))+
+  standard_theme2()+
+  theme(legend.position = c(0.35, 0.8), legend.direction="horizontal",
+        legend.background = element_rect(colour ="black")) +
+  scale_x_continuous(breaks = c(0,1/8,1/4,1/2,1,2),
+                     labels = c(0,"1/8","1/4","1/2","1","2"))
+
+ForecastsSumm2 <- Forecasts %>%
+  filter(rmse.norm == min_rmse)%>%
+  mutate(SamplingFreq = 1/SamplingInterval) %>%
+  group_by(n,sd,growth_rate)%>%
+  summarize(medianFreq = median(SamplingFreq),
+            Freq0.025 = quantile(SamplingFreq, 0.025),
+            Freq0.975 = quantile(SamplingFreq, 0.975),
+            sd_freq=sd(SamplingFreq),
+            SamplingFreq=mean(SamplingFreq)) 
+
+p.b <- ForecastsSumm2 %>%
+  filter(sd==60, n==75) %>%
+  ggplot(aes(growth_rate,SamplingFreq))+
+  geom_ribbon(aes(ymin=SamplingFreq-sd_freq, ymax=SamplingFreq+sd_freq),col=NA,alpha=0.2)+
+  geom_point(size=2.3) +
+  geom_line()+
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="Growth rate") +
+  scale_y_continuous(breaks = c(0,1/8,1/4,1/2,1,2),
+                     labels = c(0,"1/8","1/4","1/2","1","2"),
+                     limits = c(1/12,1.6))+
+  standard_theme2()
+
+
+### sampling frequency
+
+p.c <- dd_subsample %>%
+  ggplot(aes(freq,medianRMSE)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.sampling.freq %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.sampling.freq %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+            aes(y=fit, group=Plankton), col="black")+
+  labs(x=expression(Sampling~frequency~(samplings/day)), y="Forecast error (RMSE)",fill="Target", tag="c")+
+  scale_x_continuous(breaks = c(0,1/12,1/6,1/3,1),
+                     labels = c(0,"1/12","1/6","1/3","1/1")) +
+  facet_wrap(~Plankton) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+  
+
+dd_subsample_formods_summ <- dd_subsample %>%
+  group_by(Target2) %>%
+  mutate(min_rmse = min(medianRMSE)) %>%
+  filter(medianRMSE == min_rmse) %>%
+  full_join(generation_times3 %>% dplyr::select(net_growth_rate,Target))
+
+
+p.d <- dd_subsample_formods_summ %>%
+  ggplot(aes(net_growth_rate,freq)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="Growth rate",fill="Target") +
+  scale_y_continuous(breaks = c(0,1/12,1/6,1/3,2/3,1),
+                     labels = c(0,"1/12","1/6","1/3","2/3","1"), 
+                     limits = c(1/12,1.6)) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none")
+
+p.b.d <- dd_subsample_formods_summ %>%
+  ggplot(aes(net_growth_rate,freq)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="(Maximum net) Growth rate",fill="Target", tag="b") +
+  geom_ribbon(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+              aes(growth_rate,SamplingFreq,ymin=SamplingFreq-sd_freq, ymax=SamplingFreq+sd_freq),
+              col=NA,alpha=0.2)+
+  geom_point(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+             aes(growth_rate,SamplingFreq),
+             size=2.3) +
+  geom_line(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+            aes(growth_rate,SamplingFreq))+
+  scale_y_continuous(breaks = c(0,1/12,1/4,1/2,1,2),
+                     labels = c(0,"1/12","1/4","1/2","1",2)) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none")
+
+
+p.e <- generation_times3_nolag %>%
+  ggplot(aes(log10net_growth_rate,medianRMSE)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  geom_ribbon(data=newdat.generationtime %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+                aes(ymin=lwr, ymax=upr, y=fit), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.generationtime %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+                aes(y=fit), col="black")+
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y="Forecast error (RMSE)") +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none")+
+  labs(tag="d")
+
+p.f <- generation_times2 %>%
+  ggplot(aes(y=log10(median_area), x=log10(net_growth_rate)))+
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  geom_ribbon(data=newdat.area.growthrate %>% dplyr::filter(Response=="log10(Median body area)"),
+                aes(x=log10net_growth_rate, ymin=lwr, ymax=upr, y=fit), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.area.growthrate %>% dplyr::filter(Response=="log10(Median body area)"),
+                aes(x=log10net_growth_rate, y=fit), col="black")+
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y=expression(log[10](Median~body~area)~(mm^2)))+
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none")+
+  labs(tag="f")
+
+
+p.g <- dd_timepoints %>%
+  ggplot(aes(propTimePoints, medianmedianRMSE)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.tp2 %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.tp2 %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+            aes(y=fit, group=Plankton), col="black") +
+  facet_wrap(~Plankton) +
+  labs(x="Proportion of time points", y="Forecast error (RMSE)", tag="e") +
+  scale_x_continuous(breaks = propTps, labels = propTpslabs) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+  
+p.leg <- get_legend(p3e+theme(legend.position = "bottom") +
+                      scale_color_manual(values = palette, aesthetics = c("fill","col")) +
+                      labs(fill="Target"))
+
+(p.a+p.b.d+plot_layout(widths = c(2,1)))/
+  (p.c+p.e+plot_layout(widths = c(2,1)))/
+  (p.f+labs(tag="e")+p.g+labs(tag="f")+plot_layout(widths = c(1,2)))/
+  p.leg + plot_layout(heights = c(4,4,4,1))
+```
+
+## Interaction figure 
+
+```{r, fig.height=8.5, fig.width=8.5, warning=FALSE}
+# numint, freq
+
+p2.a <- dd_subsample %>%
+  ggplot(aes(freq,NumberOfInteractions)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.sampling.freq %>% dplyr::filter(Response=="Number of interactions"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.sampling.freq %>% dplyr::filter(Response=="Number of interactions"),
+            aes(y=fit, group=Plankton), col="black")+
+  labs(x=expression(Sampling~frequency~(samplings/day)), y="Number of interactions",fill="Target", tag="a")+
+  scale_x_continuous(breaks = c(0,1/12,1/6,1/3,1),
+                     labels = c(0,"1/12","1/6","1/3","1/1")) +
+  facet_wrap(~Plankton) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# meanint, freq
+
+p2.b <- dd_subsample %>%
+  ggplot(aes(freq,mean_mean_abs)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  labs(x=expression(Sampling~frequency~(samplings/day)), y="Mean interaction strength",fill="Target", tag="b")+
+  scale_x_continuous(breaks = c(0,1/12,1/6,1/3,1),
+                     labels = c(0,"1/12","1/6","1/3","1/1")) +
+  facet_wrap(~Plankton) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# numint, growth
+
+p2.c <- generation_times3_nolag2 %>%
+  ggplot(aes(log10net_growth_rate,NumberOfInteractions)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y="Number of interactions",tag="e",fill="Target") +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))
+
+# meanint, growth
+
+p2.d <- generation_times3_nolag2 %>%
+  ggplot(aes(log10net_growth_rate,mean_mean_abs)) +
+  geom_point(aes(fill=Target2), shape=21, size=2.5) +
+  labs(x=expression(log[10](Maximum~net~growth~rate)),
+       y="Mean interaction strength",fill="Target",tag="f")+
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))
+
+
+# numint, time points
+
+p2.e <- dd_timepoints %>%
+  ggplot(aes(propTimePoints,NumberOfInteractions)) +
+  geom_point(aes(fill=Target2), 
+             position = position_jitter(0.01),
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.tp2 %>% dplyr::filter(Response=="Number of interactions"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.tp2 %>% dplyr::filter(Response=="Number of interactions"),
+            aes(y=fit, group=Plankton), col="black") +
+  facet_wrap(~Plankton) +
+  labs(x="Proportion of time points", y="Number of interactions",fill="Target",tag="c") +
+  scale_x_continuous(breaks = propTps, labels = propTpslabs)+
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2.f <- dd_timepoints %>%
+  ggplot(aes(propTimePoints,mean_mean_abs)) +
+  geom_point(aes(fill=Target2), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.tp2 %>% dplyr::filter(Response=="Mean interaction strength"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.tp2 %>% dplyr::filter(Response=="Mean interaction strength"),
+            aes(y=fit, group=Plankton), col="black") +
+  facet_wrap(~Plankton) +
+  labs(x="Proportion of time points", y="Mean interaction strength",fill="Target",tag="d") +
+  scale_x_continuous(breaks = propTps, labels = propTpslabs)+
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+(p2.a + p2.b + p2.e + p2.f + p2.c + p2.d + plot_layout(ncol = 2))/p.leg + plot_layout(heights = c(12,1))
+```
+
+
+
+## Influence of sampling design on the detection of correlations between variables
+
+```{r, fig.height=6, fig.width=8, warning=FALSE}
+secondrow <- c(`1/12 of time points` = "#1B9E77", 
+               `2/12 of time points` = "#D95F02", `3/12 of time points` = "#7570B3", 
+               `6/12 of time points` = "#E7298A", `9/12 of time points` = "#E6AB02", 
+               `12/12 of time points` = "#000000")
+
+fig4a2.2 <- dd.slopes %>%
+  dplyr::filter(Response=="Forecast error (RMSE)", Regressor == "Number of interactions",
+                Dataset!="Daugaard et al. (2022)") %>% 
+  ggplot(aes(x=Dataset, y=estimate, col = Dataset, fill = Dataset))+
+  geom_hline(yintercept = 0, linetype = 2)+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.3)+
+  geom_point(pch=23, size=2.5)+
+  standard_theme2(legend = "none") +
+  coord_flip()+
+  scale_x_discrete(limits=rev, labels = c("1/12","1/6","1/3","1/1")) +
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill")) +
+  labs(y="Slope between the number of\ninteractions and forecast error", x="Sampling frequency\n(samplings/day)") +
+  ylim(-0.075,0.08) +
+  labs(tag = "a") +
+  theme(axis.title.x = element_blank())
+
+
+fig4b2.2 <- dd.slopes %>%
+  dplyr::filter(Response=="Forecast error (RMSE)", Regressor == "Mean interaction strength",
+                Dataset!="Daugaard et al. (2022)") %>%
+  ggplot(aes(x=Dataset, y=estimate, col = Dataset, fill = Dataset))+
+  geom_hline(yintercept = 0, linetype = 2)+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.3)+
+  geom_point(pch=23, size=2.5)+
+  standard_theme2(legend = "none") +
+  coord_flip()+
+  scale_x_discrete(limits=rev, labels = c("1/12","1/6","1/3","1/1")) +
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill")) +
+  labs(y="Slope between the mean interaction\nstrength and forecast error", x="r") +
+  ylim(-1.2,1.2) +
+  labs(tag = "b")+
+  theme(axis.title = element_blank())
+
+
+secondrow2 <- c(`1/12` = "#1B9E77", 
+                `2/12` = "#D95F02", `3/12` = "#7570B3", 
+                `6/12` = "#E7298A", `9/12` = "#E6AB02", 
+                `12/12` = "#000000")
+
+fig4a2.tp.2 <- dd.slopes.tp %>%
+  dplyr::mutate(percentData = case_when(percentData==8.3 ~ "1/12",
+                                        percentData==16.7 ~ "2/12",
+                                        percentData==25 ~ "3/12",
+                                        percentData==50 ~ "6/12",
+                                        percentData==75 ~ "9/12",
+                                        percentData==100 ~ "12/12"),
+                percentData = factor(percentData, levels = c("12/12", "9/12", "6/12", 
+                                                             "3/12", "2/12", "1/12"))) %>%
+  dplyr::filter(Response=="Forecast error (RMSE)", Regressor == "Number of interactions") %>% 
+  ggplot(aes(x=as.factor(percentData), y=estimate, col = as.factor(percentData), fill = as.factor(percentData)))+
+  geom_hline(yintercept = 0, linetype = 2)+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.3)+
+  geom_point(pch=23, size=2.5)+
+  standard_theme2(legend = "none") +
+  coord_flip()+
+  scale_x_discrete(limits=rev) +
+  scale_color_manual(values = secondrow2, aesthetics = c("col","fill")) +
+  labs(y="Slope between the number of\ninteractions and forecast error", x="Proportion ot time points", tag = "c")+
+  ylim(-0.075,0.08) +
+  theme(axis.title.x = element_blank())
+
+fig4b2.tp.2 <- dd.slopes.tp %>%
+  dplyr::mutate(percentData = case_when(percentData==8.3 ~ "1/12",
+                                        percentData==16.7 ~ "2/12",
+                                        percentData==25 ~ "3/12",
+                                        percentData==50 ~ "6/12",
+                                        percentData==75 ~ "9/12",
+                                        percentData==100 ~ "12/12"),
+                percentData = factor(percentData, levels = c("12/12", "9/12", "6/12", 
+                                                             "3/12", "2/12", "1/12"))) %>%
+  dplyr::filter(Response=="Forecast error (RMSE)", Regressor == "Mean interaction strength") %>% 
+  ggplot(aes(x=as.factor(percentData), y=estimate, col = as.factor(percentData), fill = as.factor(percentData)))+
+  geom_hline(yintercept = 0, linetype = 2)+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.3)+
+  geom_point(pch=23, size=2.5)+
+  standard_theme2(legend = "none") +
+  coord_flip()+
+  scale_x_discrete(limits=rev) +
+  scale_color_manual(values = secondrow2, aesthetics = c("col","fill")) +
+  labs(y="Slope between the mean interaction\nstrength and forecast error", x="", tag = "d")+ 
+  ylim(-1.2,1.2)  +
+  theme(axis.title = element_blank())
+
+
+fig4Daug1 <- dd.slopes %>%
+  dplyr::filter(Response=="Forecast error (RMSE)", Regressor == "Number of interactions",
+                Dataset=="Daugaard et al. (2022)") %>% 
+  ggplot(aes(x=Dataset, y=estimate, col = Dataset, fill = Dataset))+
+  geom_hline(yintercept = 0, linetype = 2)+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.3)+
+  geom_point(pch=23, size=2.5)+
+  standard_theme2(legend = "none") +
+  coord_flip()+
+  scale_x_discrete(limits=rev, labels = "Daugaard\net al. (2022)") +
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill")) +
+  labs(y="Slope between the number of\ninteractions and forecast error",x="") +
+  ylim(-0.075,0.08) +
+  labs(tag = "e") +
+  theme(axis.text.y = element_text(angle=90, hjust = 0.5))
+
+
+fig4Daug2 <- dd.slopes %>%
+  dplyr::filter(Response=="Forecast error (RMSE)", Regressor == "Mean interaction strength",
+                Dataset=="Daugaard et al. (2022)") %>%
+  ggplot(aes(x=Dataset, y=estimate, col = Dataset, fill = Dataset))+
+  geom_hline(yintercept = 0, linetype = 2)+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.3)+
+  geom_point(pch=23, size=2.5)+
+  standard_theme2(legend = "none") +
+  coord_flip()+
+  scale_x_discrete(limits=rev, labels = "Daugaard\net al. (2022)") +
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill")) +
+  labs(y="Slope between the mean interaction\nstrength and forecast error",x="") +
+  ylim(-1.2,1.2) +
+  labs(tag = "f")+
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(angle=90, hjust = 0.5))
+
+
+# (fig4a2.2+fig4b2.2)/(fig4a2.tp.2+fig4b2.tp.2)/(fig4Daug1+fig4Daug2) + plot_layout(heights = c(4,4,1))
+fig4a2.2 + fig4b2.2 + fig4a2.tp.2 + fig4b2.tp.2 + fig4Daug1 + fig4Daug2 + plot_layout(ncol = 2, heights = c(4,4,1))
+```
+
+
+# Appendix S1: Supporting Information
+
+## S1 Extended methods
+### S1.1 Simulation Study
+
+Figure S1: effect of r tau
+
+```{r, fig.width=8, fig.height=5}
+growth_rates <- seq(0.3,1.2,0.3)
+taus <- round(2.3/growth_rates,2)
+
+dynms <- lapply(1:length(growth_rates), function(i){
+  growth_rate <- growth_rates[i]
+  tau <- taus[i]
+  model <- gen$new(r = growth_rate, N_ini=800, tau=tau, K=500)
+  run <- data.frame(model$run(seq(0,250, by = 0.01)))
+  
+  calculated_r <- with(run, round(max(log(N/lag(N))/(t-lag(t)), na.rm = T),2))
+  
+  run$tau <- taus[i]
+  run$growth_rate <- growth_rate
+  run$r_and_tau <- paste0("r = ",growth_rate,"; tau = ",taus[i],": r tau = ", round(growth_rate*taus[i],2))
+  run
+})
+
+dynms <- do.call("rbind",dynms)
+
+dynms %>%
+  ggplot(aes(t,N))+
+  geom_line() +
+  theme_bw() +
+  facet_wrap(~r_and_tau)+
+  labs(x="Time (days)",y="Abundance (individuals)")
+```
+
+
+Figure S2: example figure of subsampled dynamics
+
+```{r, fig.height=7, fig.width=7}
+n <- 600
+growth_rate <- 0.6
+tau <- round(2.3/growth_rate,2)
+sd = 60
+model <- gen$new(r = growth_rate, N_ini=800, tau=tau, K=500)
+step=0.01
+SamplingInterval <- c(0.5,1,2,4,8)
+
+adjusted15 <- ceiling(15 * max(SamplingInterval))
+ns <- seq(adjusted15*3,adjusted15*7,adjusted15)
+
+# run the simulation
+truth <- data.frame(model$run(seq(0,3.1*n-step, by = step)))
+# remove burn-in
+truth <- truth %>%
+  filter(row_number() > n/step)
+# training data
+run <- truth %>% 
+  filter(row_number() <= n/step)
+
+run$N.noise <- run$N + rtruncnorm(1, a = -(run$N-1), mean=0, sd = sd) # add noise to training dataset
+
+for(j in 1:length(SamplingInterval)){ # create subsampling
+  run <- run %>%
+    mutate(t = round(t,2),
+           !!paste(SamplingInterval[j]) := ifelse(t %in% round(seq(min(run$t),max(run$t),SamplingInterval[j]),2),
+                                                  N.noise,NA))
+}
+
+runLong <- run %>% # changing to long format
+  dplyr::select(-Nlag, -N.noise) %>%
+  pivot_longer(cols = -t, names_to = "SamplingInterval") %>%
+  na.omit()
+
+length <- min(table(runLong$SamplingInterval)) # minimal number of time points 
+
+runLongReduced <- runLong %>% # make all timeseries have the same number of time points regardless of sampling
+  group_by(SamplingInterval) %>%
+  filter(ifelse(SamplingInterval=="N",
+                row_number() <= nrow(runLong),
+                row_number() <= length)) %>%
+  mutate(n=n())  %>%
+  mutate(Interval = ifelse(SamplingInterval=="1",
+                           paste("Interval:", SamplingInterval, "day"),
+                           ifelse(SamplingInterval=="N", "Truth", 
+                                  paste("Interval:", SamplingInterval, "days"))))
+
+runLongReducedwider <- runLongReduced %>%
+  ungroup() %>%
+  dplyr::select(-SamplingInterval, -n) %>%
+  pivot_wider(names_from = Interval, values_from = value) %>%
+  pivot_longer(cols = c("Interval: 0.5 days","Interval: 1 day",
+                        "Interval: 2 days","Interval: 4 days",
+                        "Interval: 8 days"), names_to = "Interval")
+
+runLongReducedwider %>%
+  # filter(Interval!="Truth") %>%
+  ggplot(aes(t-min(t),value))+
+  geom_line(aes(y=Truth), col="grey", alpha=0.5) +
+  geom_point(size=0.5)+
+  facet_grid(Interval~1)+
+  theme_bw() +
+  theme(strip.background.x = element_blank(),
+        strip.text.x = element_blank(),
+        strip.background.y = element_rect(fill = "white"))+
+  labs(x="Time (days)", y="Abundance (individuals)")
+```
+
+### S1.2 High frequency field data
+#### S1.2.1 Data collection 
+
+```{r, fig.height=10, fig.width=8}
+ddHF_GRE2_plot2 <- ddHF_GRE2_plot %>%
+  dplyr::filter(!(subgroup %in% c("chaoborus","leptodora"))) %>%
+  mutate(subgroup = as.factor(subgroup),
+         Name = fct_recode(subgroup,
+                           "Phytoplankton size bin 1" = "cluster_1",
+                           "Phytoplankton size bin 2" = "cluster_2",
+                           "Phytoplankton size bin 3" = "cluster_3",
+                           "Phytoplankton size bin 4" = "cluster_4",
+                           "Phytoplankton size bin 5" = "cluster_5",
+                           "Phytoplankton size bin 6" = "cluster_6",
+                           "Calanoid copepods"= "calanoid_copepods",
+                           "Ciliates"= "ciliates",
+                           "Cyclopoid copepods"= "cyclopoid_copepods",
+                           "Daphnids" = "daphnids",
+                           "Nauplii" = "nauplii",
+                           "Rotifers" = "rotifers",
+                           "Ammonium" = "Ammonium",
+                           "Nitrate" = "Nitrat",
+                           "Phosphate" = "oP",
+                           "Mean epilimnion temperature" = "mean_epi_temp",
+                           "mean mixed layer depth" = "mean_mixed_layer_depth",
+                           "Mean mixed layer irradiance" = "ml_irradiance"),
+         Name = factor(Name, levels=sort(levels(Name))))
+
+ddHF_GRE2_plot2 %>%
+  ggplot(aes(date, value, col=Name))+
+  geom_line() +
+  geom_point(data=ddHF_GRE2_plot2 %>% dplyr::filter(Name %in% c("Ammonium","Nitrate","Phosphate")),
+             size=0.6)+
+  standard_theme() +
+  facet_wrap(~Name,scales = "free", nrow = 6)+
+  labs(y="Value", x="Date")
+```
+
+
+#### S1.2.2 Motivation and justification of phytoplankton binning
+#### S1.2.3 Further processing of recorded time series
+
+```{r, fig.height=10, fig.width=8}
+ddHF_GRE_long2_supplplot <- ddHF_GRE_long2 %>%
+  dplyr::filter(!(name %in% c("chaoborus","leptodora"))) %>%
+  mutate(name = as.factor(name),
+         Name = fct_recode(name,
+                           "Phytoplankton size bin 1" = "cluster_1",
+                           "Phytoplankton size bin 2" = "cluster_2",
+                           "Phytoplankton size bin 3" = "cluster_3",
+                           "Phytoplankton size bin 4" = "cluster_4",
+                           "Phytoplankton size bin 5" = "cluster_5",
+                           "Phytoplankton size bin 6" = "cluster_6",
+                           "Calanoid copepods"= "calanoid_copepods",
+                           "Ciliates"= "ciliates",
+                           "Cyclopoid copepods"= "cyclopoid_copepods",
+                           "Daphnids" = "daphnids",
+                           "Nauplii" = "nauplii",
+                           "Rotifers" = "rotifers",
+                           "Ammonium" = "ammonium",
+                           "Nitrate" = "nitrate",
+                           "Phosphate" = "phosphate",
+                           "Mean epilimnion temperature" = "mean_epi_temp",
+                           "mean mixed layer depth" = "mean_mixed_layer_depth",
+                           "Mean mixed layer irradiance" = "ml_irradiance"),
+         Name = factor(Name, levels=sort(levels(Name))))
+
+ddHF_GRE_long2_supplplot %>%
+  ggplot(aes(date, value, col=Name))+
+  geom_line() +
+  standard_theme() +
+  facet_wrap(~Name,scales = "free", nrow = 6)+
+  labs(y="Standardized value", x="Date")
+```
+
+
+## S2 Additional figures and tables
+### S2.1 Forecast error as a function of sampling design and target traits
+
+#### Additional simulation figure 
+
+```{r, fig.height=6, fig.width=9}
+ForecastsSumm2 <- Forecasts %>%
+  dplyr::mutate(SamplingFreq = 1/SamplingInterval) %>%
+  filter(rmse.norm == min_rmse)%>%
+  group_by(n,sd,growth_rate)%>%
+  summarize(sd_freq=sd(SamplingFreq),
+            SamplingFreq=mean(SamplingFreq)) %>%
+  dplyr::mutate(sd2 = paste0("Std. dev. = ",sd," (individuals)"),
+                n2 = paste0("Number of time points = ",n),
+                n2 = factor(n2, levels = c("Number of time points = 45",
+                                           "Number of time points = 60",
+                                           "Number of time points = 75",
+                                           "Number of time points = 90",
+                                           "Number of time points = 105")))
+
+
+ForecastsSumm2 %>%
+  ggplot(aes(growth_rate,SamplingFreq))+
+  geom_ribbon(aes(ymin=SamplingFreq-sd_freq, ymax=SamplingFreq+sd_freq),col=NA,alpha=0.2)+
+  geom_point(size=2.3) +
+  geom_line()+
+  facet_grid(sd2~n2)+
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="Growth rate") +
+  scale_y_continuous(breaks = c(0,1/8,1/4,1/2,1,2),
+                     labels = c(0,"1/8","1/4","1/2","1","2"))+
+  standard_theme2()
+```
+
+#### Table: Forecast error table
+
+```{r}
+freq.reg.tab <- data.frame(MainExpVar = "Sampling frequency",
+                           Covariate = c("Intercept","Sampl. freq","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.sampling.RMSE),as.data.frame(VarCorr(m.sampling.RMSE))$sdcor[1:2]),
+                           DF = c(round(summary(m.sampling.RMSE)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.sampling.RMSE)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.sampling.RMSE)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.sampling.RMSE)$coef[, 5, drop = FALSE],NA,NA))
+
+freq.anova.tab <- data.frame(MainExpVar = "Sampling frequency",
+                             Covariate = c("Sampl. freq","Plankton","Interaction"),
+                             Type = "Sum of sq.",
+                             Estimate = anova(m.sampling.RMSE)[,1],
+                             DF= paste(anova(m.sampling.RMSE)[,3],round(anova(m.sampling.RMSE)[,4],1), sep = ", "),
+                             SE = NA,
+                             Test = "\\textit{F}",
+                             Test.value = anova(m.sampling.RMSE)[,5],
+                             p.value = anova(m.sampling.RMSE)[,6])
+
+Numtp.reg.tab <- data.frame(MainExpVar = "Prop. of time points",
+                           Covariate = c("Intercept","Time points prop.","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.tp.RMSE),as.data.frame(VarCorr(m.tp.RMSE))$sdcor[1:2]),
+                           DF = c(round(summary(m.tp.RMSE)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.tp.RMSE)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.tp.RMSE)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.tp.RMSE)$coef[, 5, drop = FALSE],NA,NA))
+
+Numtp.anova.tab <- data.frame(MainExpVar = "Prop. of time points",
+                              Covariate = c("Time points prop.","Plankton","Interaction"),
+                              Type = "Sum of sq.",
+                              Estimate = anova(m.tp.RMSE)[,1],
+                              DF= paste(anova(m.tp.RMSE)[,3],round(anova(m.tp.RMSE)[,4],1), sep = ", "),
+                              SE = NA,
+                              Test = "\\textit{F}",
+                              Test.value = anova(m.tp.RMSE)[,5],
+                              p.value = anova(m.tp.RMSE)[,6])
+
+growth.reg.tab <- data.frame(MainExpVar = "Net growth rate",
+                             Covariate = c("Intercept","log10(net growth rate)"),
+                             Type = c(rep("Fix. eff.",2)),
+                             Estimate = coef(m.doubling.RMSE),
+                             DF = summary(m.doubling.RMSE)$df[2],
+                             SE = unname(summary(m.doubling.RMSE)$coef[,2,drop = FALSE]),
+                             Test = rep("\\textit{t}",2),
+                             Test.value = unname(summary(m.doubling.RMSE)$coef[,3,drop = FALSE]),
+                             p.value = unname(summary(m.doubling.RMSE)$coef[, 4, drop = FALSE]))
+
+area.reg.tab <- data.frame(MainExpVar = "Median area",
+                           Covariate = c("Intercept","log10(median area)"),
+                           Type = c(rep("Fix. eff.",2)),
+                           Estimate = coef(m.area.RMSE),
+                           DF = summary(m.area.RMSE)$df[2],
+                           SE = unname(summary(m.area.RMSE)$coef[,2,drop = FALSE]),
+                           Test = rep("\\textit{t}",2),
+                           Test.value = unname(summary(m.area.RMSE)$coef[,3,drop = FALSE]),
+                           p.value = unname(summary(m.area.RMSE)$coef[, 4, drop = FALSE]))
+
+
+forecast.tab <- rbind(freq.reg.tab,
+                      freq.anova.tab,
+                      Numtp.reg.tab,
+                      Numtp.anova.tab,
+                      growth.reg.tab,
+                      area.reg.tab)
+rownames(forecast.tab)<- NULL
+
+
+forecast.tab$p.value <- ifelse(forecast.tab$p.value<0.0001, "<0.0001",
+												 sprintf("%.4f", round(forecast.tab$p.value,4)))
+
+forecast.tab <- forecast.tab %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+# write.csv(forecast.tab, "forecast.tab.csv")
+forecast.tab
+```
+
+
+#### Table: Body size vs growth rate
+
+
+```{r}
+size.growth.reg.tab <- data.frame(Response = "log10(median area)",
+                                  Covariate = c("Intercept","log10(net growth rate)"),
+                                  Type = c(rep("Fix. eff.",2)),
+                                  Estimate = coef(m.area.growthrate),
+                                  DF = summary(m.area.growthrate)$df[2],
+                                  SE = unname(summary(m.area.growthrate)$coef[,2,drop = FALSE]),
+                                  Test = rep("t",2),
+                                  Test.value = unname(summary(m.area.growthrate)$coef[,3,drop = FALSE]),
+                                  p.value = unname(summary(m.area.growthrate)$coef[, 4, drop = FALSE]))
+rownames(size.growth.reg.tab) <- NULL
+
+size.growth.reg.tab$p.value <- ifelse(size.growth.reg.tab$p.value<0.0001, "<0.0001",
+												 sprintf("%.4f", round(size.growth.reg.tab$p.value,4)))
+
+size.growth.reg.tab <- size.growth.reg.tab %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+
+# write.csv(size.growth.reg.tab, "size.growth.reg.tab.csv")
+size.growth.reg.tab
+```
+
+
+
+#### Body size figure
+
+```{r, fig.height=5, fig.width=10}
+p3a2 + p3b2 + p3c2  + plot_layout(guides = "collect", ncol = 3) &
+  standard_theme2(legend = "right") &
+  scale_color_manual(values = palette, aesthetics = c("fill","col")) &
+  labs(fill="Target")
+```
+
+### S2.2 Interaction estimates as a function of sampling design and target traits
+
+#### Table: numInt table
+
+```{r}
+freq.reg.tab <- data.frame(MainExpVar = "Sampling frequency",
+                           Covariate = c("Intercept","Sampl. freq","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.sampling.NumInt),as.data.frame(VarCorr(m.sampling.NumInt))$sdcor[1:2]),
+                           DF = c(round(summary(m.sampling.NumInt)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.sampling.NumInt)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.sampling.NumInt)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.sampling.NumInt)$coef[, 5, drop = FALSE],NA,NA))
+
+freq.anova.tab <- data.frame(MainExpVar = "Sampling frequency",
+                             Covariate = c("Sampl. freq","Plankton","Interaction"),
+                             Type = "Sum of sq.",
+                             Estimate = anova(m.sampling.NumInt)[,1],
+                             DF= paste(anova(m.sampling.NumInt)[,3],round(anova(m.sampling.NumInt)[,4],1), sep = ", "),
+                             SE = NA,
+                             Test = "\\textit{F}",
+                             Test.value = anova(m.sampling.NumInt)[,5],
+                             p.value = anova(m.sampling.NumInt)[,6])
+
+Numtp.reg.tab <- data.frame(MainExpVar = "Prop. of time points",
+                           Covariate = c("Intercept","Time points prop.","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.tp.NumInt),as.data.frame(VarCorr(m.tp.NumInt))$sdcor[1:2]),
+                           DF = c(round(summary(m.tp.NumInt)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.tp.NumInt)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.tp.NumInt)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.tp.NumInt)$coef[, 5, drop = FALSE],NA,NA))
+
+Numtp.anova.tab <- data.frame(MainExpVar = "Prop. of time points",
+                              Covariate = c("Time points prop.","Plankton","Interaction"),
+                              Type = "Sum of sq.",
+                              Estimate = anova(m.tp.NumInt)[,1],
+                              DF= paste(anova(m.tp.NumInt)[,3],round(anova(m.tp.NumInt)[,4],1), sep = ", "),
+                              SE = NA,
+                              Test = "\\textit{F}",
+                              Test.value = anova(m.tp.NumInt)[,5],
+                              p.value = anova(m.tp.NumInt)[,6])
+
+growth.reg.tab <- data.frame(MainExpVar = "Net growth rate",
+                             Covariate = c("Intercept","log10(net growth rate)"),
+                             Type = c(rep("Fix. eff.",2)),
+                             Estimate = coef(m.doubling.NumInt),
+                             DF = summary(m.doubling.NumInt)$df[2],
+                             SE = unname(summary(m.doubling.NumInt)$coef[,2,drop = FALSE]),
+                             Test = rep("\\textit{t}",2),
+                             Test.value = unname(summary(m.doubling.NumInt)$coef[,3,drop = FALSE]),
+                             p.value = unname(summary(m.doubling.NumInt)$coef[, 4, drop = FALSE]))
+
+area.reg.tab <- data.frame(MainExpVar = "Median area",
+                           Covariate = c("Intercept","log10(median area)"),
+                           Type = c(rep("Fix. eff.",2)),
+                           Estimate = coef(m.area.NumInt),
+                           DF = summary(m.area.NumInt)$df[2],
+                           SE = unname(summary(m.area.NumInt)$coef[,2,drop = FALSE]),
+                           Test = rep("\\textit{t}",2),
+                           Test.value = unname(summary(m.area.NumInt)$coef[,3,drop = FALSE]),
+                           p.value = unname(summary(m.area.NumInt)$coef[, 4, drop = FALSE]))
+
+
+numInt.tab <- rbind(freq.reg.tab,
+                    freq.anova.tab,
+                    Numtp.reg.tab,
+                    Numtp.anova.tab,
+                    growth.reg.tab,
+                    area.reg.tab)
+rownames(numInt.tab)<- NULL
+
+
+numInt.tab$p.value <- ifelse(numInt.tab$p.value<0.0001, "<0.0001",
+												 sprintf("%.4f", round(numInt.tab$p.value,4)))
+
+numInt.tab <- numInt.tab %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+# write.csv(numInt.tab, "numInt.tab.csv")
+numInt.tab
+```
+
+
+#### Table: MeanInt table
+
+```{r}
+freq.reg.tab <- data.frame(MainExpVar = "Sampling frequency",
+                           Covariate = c("Intercept","Sampl. freq","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.sampling.MeanInt),as.data.frame(VarCorr(m.sampling.MeanInt))$sdcor[1:2]),
+                           DF = c(round(summary(m.sampling.MeanInt)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.sampling.MeanInt)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.sampling.MeanInt)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.sampling.MeanInt)$coef[, 5, drop = FALSE],NA,NA))
+
+freq.anova.tab <- data.frame(MainExpVar = "Sampling frequency",
+                             Covariate = c("Sampl. freq","Plankton","Interaction"),
+                             Type = "Sum of sq.",
+                             Estimate = anova(m.sampling.MeanInt)[,1],
+                             DF= paste(anova(m.sampling.MeanInt)[,3],round(anova(m.sampling.MeanInt)[,4],1), sep = ", "),
+                             SE = NA,
+                             Test = "\\textit{F}",
+                             Test.value = anova(m.sampling.MeanInt)[,5],
+                             p.value = anova(m.sampling.MeanInt)[,6])
+
+Numtp.reg.tab <- data.frame(MainExpVar = "Prop. of time points",
+                           Covariate = c("Intercept","Time points prop.","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.tp.MeanInt),as.data.frame(VarCorr(m.tp.MeanInt))$sdcor[1:2]),
+                           DF = c(round(summary(m.tp.MeanInt)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.tp.MeanInt)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.tp.MeanInt)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.tp.MeanInt)$coef[, 5, drop = FALSE],NA,NA))
+
+Numtp.anova.tab <- data.frame(MainExpVar = "Prop. of time points",
+                              Covariate = c("Time points prop.","Plankton","Interaction"),
+                              Type = "Sum of sq.",
+                              Estimate = anova(m.tp.MeanInt)[,1],
+                              DF= paste(anova(m.tp.MeanInt)[,3],round(anova(m.tp.MeanInt)[,4],1), sep = ", "),
+                              SE = NA,
+                              Test = "\\textit{F}",
+                              Test.value = anova(m.tp.MeanInt)[,5],
+                              p.value = anova(m.tp.MeanInt)[,6])
+
+growth.reg.tab <- data.frame(MainExpVar = "Net growth rate",
+                             Covariate = c("Intercept","log10(net growth rate)"),
+                             Type = c(rep("Fix. eff.",2)),
+                             Estimate = coef(m.doubling.MeanInt),
+                             DF = summary(m.doubling.MeanInt)$df[2],
+                             SE = unname(summary(m.doubling.MeanInt)$coef[,2,drop = FALSE]),
+                             Test = rep("\\textit{t}",2),
+                             Test.value = unname(summary(m.doubling.MeanInt)$coef[,3,drop = FALSE]),
+                             p.value = unname(summary(m.doubling.MeanInt)$coef[, 4, drop = FALSE]))
+
+area.reg.tab <- data.frame(MainExpVar = "Median area",
+                           Covariate = c("Intercept","log10(median area)"),
+                           Type = c(rep("Fix. eff.",2)),
+                           Estimate = coef(m.area.MeanInt),
+                           DF = summary(m.area.MeanInt)$df[2],
+                           SE = unname(summary(m.area.MeanInt)$coef[,2,drop = FALSE]),
+                           Test = rep("\\textit{t}",2),
+                           Test.value = unname(summary(m.area.MeanInt)$coef[,3,drop = FALSE]),
+                           p.value = unname(summary(m.area.MeanInt)$coef[, 4, drop = FALSE]))
+
+
+MeanInt.tab <- rbind(freq.reg.tab,
+                     freq.anova.tab,
+                     Numtp.reg.tab,
+                     Numtp.anova.tab,
+                     growth.reg.tab,
+                     area.reg.tab)
+rownames(MeanInt.tab)<- NULL
+
+
+MeanInt.tab$p.value <- ifelse(MeanInt.tab$p.value<0.0001, "<0.0001",
+                              sprintf("%.4f", round(MeanInt.tab$p.value,4)))
+
+MeanInt.tab <- MeanInt.tab %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+# write.csv(MeanInt.tab, "MeanInt.tab.csv")
+MeanInt.tab
+```
+
+
+#### Random slopes
+
+```{r, fig.height=4, fig.width=8}
+randomSlopes %>%
+  ggplot(aes(grp,condval))+
+  geom_hline(yintercept = 0)+
+  geom_errorbar(aes(ymin=lwr, ymax=upr), width=0.1)+
+  geom_point()+
+  standard_theme2()+
+  facet_wrap(~Parameter)+
+  coord_flip()+
+  theme(axis.title.y = element_blank())+
+  labs(y="Value")
+```
+
+#### Diminuishing variation
+
+```{r, fig.height=4, fig.width=8}
+sd_dd_timepoints %>%
+  ggplot(aes(propTimePoints, sd_numInt))+
+  geom_smooth(method = "lm", col="black", alpha=0.2, linewidth=.5)+
+  geom_point()+
+  facet_wrap(~Plankton)+
+  standard_theme2()+
+  scale_x_continuous(breaks = propTps, labels = propTpslabs) +
+  labs(x="Proportion of time points", y="Standard deviation of estimated\nnumber of interactions")+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### S2.3 Influence of sampling design on the detection of correlations between variables
+
+
+#### Table: Interactions vs RMSE
+
+```{r}
+dd.slopes2 <- data.frame(Response = rep(c("Forecast error (RMSE)","Forecast error (RMSE)","Mean interaction strength"), each=8),
+                         Dataset = rep(c("Sampling freq: every day", "Sampling freq: every day", 
+                                         "Sampling freq: every 3 days", "Sampling freq: every 3 days", 
+                                         "Sampling freq: every 6 days", "Sampling freq: every 6 days",
+                                         "Sampling freq: every 12 days", "Sampling freq: every 12 days"), 
+                                       times=3),
+                         Covariate = c(rep(c("Intercept","Number of interactions"),4),
+                                       rep(c("Intercept","Mean interaction strength"),4),
+                                       rep(c("Intercept","Number of interactions"),4)),
+                         Estimate = c(c(coef(m.rmse.numint.reduced.1day), coef(m.rmse.numint.reduced.3days), 
+                                        coef(m.rmse.numint.reduced.6days), coef(m.rmse.numint.reduced.12days)),
+                                      c(coef(m.rmse.meanint.reduced.1day), coef(m.rmse.meanint.reduced.3days),
+                                        coef(m.rmse.meanint.reduced.6days), coef(m.rmse.meanint.reduced.12days)),
+                                      c(coef(m.numint.meanint.reduced.1day), coef(m.numint.meanint.reduced.3days),
+                                        coef(m.numint.meanint.reduced.6days), coef(m.numint.meanint.reduced.12days))),
+                         DF = summary(m.rmse.numint.reduced.1day)$df[2],
+                         SE = c(summary(m.rmse.numint.reduced.1day)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.reduced.3days)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.reduced.6days)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.reduced.12days)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.reduced.1day)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.reduced.3days)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.reduced.6days)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.reduced.12days)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.reduced.1day)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.reduced.3days)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.reduced.6days)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.reduced.12days)$coef[,2,drop = FALSE]),
+                         Test = "t",
+                         Test.value = c(summary(m.rmse.numint.reduced.1day)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.reduced.3days)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.reduced.6days)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.reduced.12days)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.reduced.1day)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.reduced.3days)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.reduced.6days)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.reduced.12days)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.reduced.1day)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.reduced.3days)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.reduced.6days)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.reduced.12days)$coef[,3,drop = FALSE]),
+                         p.value = c(summary(m.rmse.numint.reduced.1day)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.reduced.3days)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.reduced.6days)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.reduced.12days)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.reduced.1day)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.reduced.3days)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.reduced.6days)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.reduced.12days)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.reduced.1day)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.reduced.3days)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.reduced.6days)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.reduced.12days)$coef[,4,drop = FALSE]),
+                         lower = c(confint(m.rmse.numint.reduced.1day)[,1],
+                                   confint(m.rmse.numint.reduced.3days)[,1],
+                                   confint(m.rmse.numint.reduced.6days)[,1],
+                                   confint(m.rmse.numint.reduced.12days)[,1],
+                                   confint(m.rmse.meanint.reduced.1day)[,1],
+                                   confint(m.rmse.meanint.reduced.3days)[,1],
+                                   confint(m.rmse.meanint.reduced.6days)[,1],
+                                   confint(m.rmse.meanint.reduced.12days)[,1],
+                                   confint(m.numint.meanint.reduced.1day)[,1],
+                                   confint(m.numint.meanint.reduced.3days)[,1],
+                                   confint(m.numint.meanint.reduced.6days)[,1],
+                                   confint(m.numint.meanint.reduced.12days)[,1]),
+                         upper = c(confint(m.rmse.numint.reduced.1day)[,2],
+                                   confint(m.rmse.numint.reduced.3days)[,2],
+                                   confint(m.rmse.numint.reduced.6days)[,2],
+                                   confint(m.rmse.numint.reduced.12days)[,2],
+                                   confint(m.rmse.meanint.reduced.1day)[,2],
+                                   confint(m.rmse.meanint.reduced.3days)[,2],
+                                   confint(m.rmse.meanint.reduced.6days)[,2],
+                                   confint(m.rmse.meanint.reduced.12days)[,2],
+                                   confint(m.numint.meanint.reduced.1day)[,2],
+                                   confint(m.numint.meanint.reduced.3days)[,2],
+                                   confint(m.numint.meanint.reduced.6days)[,2],
+                                   confint(m.numint.meanint.reduced.12days)[,2]))
+
+
+dd.slopes3 <- data.frame(Response = rep(c("Forecast error (RMSE)","Forecast error (RMSE)","Mean interaction strength"), each=12),
+                         Dataset = rep(c("Prop. of time points: 1/12", "Prop. of time points: 1/12",
+                                         "Prop. of time points: 2/12", "Prop. of time points: 2/12",
+                                         "Prop. of time points: 3/12", "Prop. of time points: 3/12",
+                                         "Prop. of time points: 6/12", "Prop. of time points: 6/12",
+                                         "Prop. of time points: 9/12", "Prop. of time points: 9/12",
+                                         "Prop. of time points: 12/12", "Prop. of time points: 12/12"),
+                                       times=3),
+                         Covariate = c(rep(c("Intercept","Number of interactions"),6),
+                                       rep(c("Intercept","Mean interaction strength"),6),
+                                       rep(c("Intercept","Number of interactions"),6)),
+                         Estimate = c(c(coef(m.rmse.numint.perc8.3), coef(m.rmse.numint.perc16.7), 
+                                        coef(m.rmse.numint.perc25), coef(m.rmse.numint.perc50),
+                                        coef(m.rmse.numint.perc75), coef(m.rmse.numint.perc100)),
+                                      c(coef(m.rmse.meanint.perc8.3), coef(m.rmse.meanint.perc16.7),
+                                        coef(m.rmse.meanint.perc25), coef(m.rmse.meanint.perc50),
+                                        coef(m.rmse.meanint.perc75), coef(m.rmse.meanint.perc100)),
+                                      c(coef(m.numint.meanint.perc8.3), coef(m.numint.meanint.perc16.7),
+                                        coef(m.numint.meanint.perc25), coef(m.numint.meanint.perc50),
+                                        coef(m.numint.meanint.perc75), coef(m.numint.meanint.perc100))),
+                         DF = summary(m.rmse.numint.perc8.3)$df[2],
+                         SE = c(summary(m.rmse.numint.perc8.3)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.perc16.7)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.perc25)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.perc50)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.perc75)$coef[,2,drop = FALSE],
+                                summary(m.rmse.numint.perc100)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.perc8.3)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.perc16.7)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.perc25)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.perc50)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.perc75)$coef[,2,drop = FALSE],
+                                summary(m.rmse.meanint.perc100)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.perc8.3)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.perc16.7)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.perc25)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.perc50)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.perc75)$coef[,2,drop = FALSE],
+                                summary(m.numint.meanint.perc100)$coef[,2,drop = FALSE]                                ),
+                         Test = "t",
+                         Test.value = c(summary(m.rmse.numint.perc8.3)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.perc16.7)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.perc25)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.perc50)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.perc75)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.numint.perc100)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.perc8.3)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.perc16.7)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.perc25)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.perc50)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.perc75)$coef[,3,drop = FALSE],
+                                        summary(m.rmse.meanint.perc100)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.perc8.3)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.perc16.7)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.perc25)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.perc50)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.perc75)$coef[,3,drop = FALSE],
+                                        summary(m.numint.meanint.perc100)$coef[,3,drop = FALSE]),
+                         p.value = c(summary(m.rmse.numint.perc8.3)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.perc16.7)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.perc25)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.perc50)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.perc75)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.numint.perc100)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.perc8.3)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.perc16.7)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.perc25)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.perc50)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.perc75)$coef[,4,drop = FALSE],
+                                     summary(m.rmse.meanint.perc100)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.perc8.3)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.perc16.7)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.perc25)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.perc50)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.perc75)$coef[,4,drop = FALSE],
+                                     summary(m.numint.meanint.perc100)$coef[,4,drop = FALSE]),
+                         lower = c(confint(m.rmse.numint.perc8.3)[,1],
+                                   confint(m.rmse.numint.perc16.7)[,1],
+                                   confint(m.rmse.numint.perc25)[,1],
+                                   confint(m.rmse.numint.perc50)[,1],
+                                   confint(m.rmse.numint.perc75)[,1],
+                                   confint(m.rmse.numint.perc100)[,1],
+                                   confint(m.rmse.meanint.perc8.3)[,1],
+                                   confint(m.rmse.meanint.perc16.7)[,1],
+                                   confint(m.rmse.meanint.perc25)[,1],
+                                   confint(m.rmse.meanint.perc50)[,1],
+                                   confint(m.rmse.meanint.perc75)[,1],
+                                   confint(m.rmse.meanint.perc100)[,1],
+                                   confint(m.numint.meanint.perc8.3)[,1],
+                                   confint(m.numint.meanint.perc16.7)[,1],
+                                   confint(m.numint.meanint.perc25)[,1],
+                                   confint(m.numint.meanint.perc50)[,1],
+                                   confint(m.numint.meanint.perc75)[,1],
+                                   confint(m.numint.meanint.perc100)[,1]),
+                         upper = c(confint(m.rmse.numint.perc8.3)[,2],
+                                   confint(m.rmse.numint.perc16.7)[,2],
+                                   confint(m.rmse.numint.perc25)[,2],
+                                   confint(m.rmse.numint.perc50)[,2],
+                                   confint(m.rmse.numint.perc75)[,2],
+                                   confint(m.rmse.numint.perc100)[,2],
+                                   confint(m.rmse.meanint.perc8.3)[,2],
+                                   confint(m.rmse.meanint.perc16.7)[,2],
+                                   confint(m.rmse.meanint.perc25)[,2],
+                                   confint(m.rmse.meanint.perc50)[,2],
+                                   confint(m.rmse.meanint.perc75)[,2],
+                                   confint(m.rmse.meanint.perc100)[,2],
+                                   confint(m.numint.meanint.perc8.3)[,2],
+                                   confint(m.numint.meanint.perc16.7)[,2],
+                                   confint(m.numint.meanint.perc25)[,2],
+                                   confint(m.numint.meanint.perc50)[,2],
+                                   confint(m.numint.meanint.perc75)[,2],
+                                   confint(m.numint.meanint.perc100)[,2]))
+
+dd.slopes4 <- rbind(dd.slopes2,dd.slopes3)
+
+rownames(dd.slopes4)<- NULL
+
+dd.slopes4$p.value <- ifelse(dd.slopes4$p.value<0.0001, "<0.0001",
+												 sprintf("%.4f", round(dd.slopes4$p.value,4)))
+
+dd.slopes4 <- dd.slopes4 %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3),
+                lower = round(lower,3),
+                upper = round(upper,3))
+# write.csv(dd.slopes4, "dd.slopes4.csv")
+dd.slopes4
+```
+
+
+
+#### Scatter plots forecast error vs interactions
+
+
+```{r, fig.height=10, fig.width=12}
+newdat.fig4.supl <- newdat.fig4 %>%
+  dplyr::mutate(Dataset = case_when(Dataset == "Sampling interval: 1 day" ~ "Sampling freq: every day",
+                                    Dataset == "Sampling interval: 3 days" ~ "Sampling freq: every 3 days",
+                                    Dataset == "Sampling interval: 6 days" ~ "Sampling freq: every 6 days",
+                                    Dataset == "Sampling interval: 12 days" ~ "Sampling freq: every 12 days"))
+
+fig4a1 <-
+  dd_subsample %>%
+  ggplot(aes(NumberOfInteractions, medianRMSE, group=Dataset, col=Dataset, fill=Dataset)) +
+  labs(x="Number of interactions", y="Forecast error (RMSE)", tag="a")  +
+  standard_theme(legend = "none") +
+  # theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+  geom_ribbon(data=newdat.fig4.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", Response=="Forecast error (RMSE)"),
+              aes(y=fit, ymin=lwr, ymax=upr), alpha=0.1, col=NA) +
+  geom_line(data=newdat.fig4.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", Response=="Forecast error (RMSE)"),
+            aes(y=fit)) +
+  geom_point(size=2.5, col="black", shape=21) + 
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill"))+
+  facet_wrap(~Dataset)
+
+fig4b1 <- dd_subsample %>%
+  ggplot(aes(mean_mean_abs, medianRMSE, group=Dataset, col=Dataset, fill=Dataset)) +
+  labs(x="Mean interaction strength", y="Forecast error (RMSE)", tag="b")  +
+  standard_theme(legend = "none") +
+  # theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+  geom_ribbon(data=newdat.fig4.supl %>% dplyr::filter(Regressor=="mean_mean_abs", Response=="Forecast error (RMSE)"),
+              aes(y=fit, ymin=lwr, ymax=upr), alpha=0.1, col=NA) +
+  geom_line(data=newdat.fig4.supl %>% dplyr::filter(Regressor=="mean_mean_abs", Response=="Forecast error (RMSE)"),
+            aes(y=fit)) +
+  geom_point(size=2.5, col="black", shape=21) + 
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill"))+
+  facet_wrap(~Dataset)
+
+
+fig4d1 <- dd_subsample %>%
+  rename(NumberOfInteractions2=NumberOfInteractions) %>%
+  ggplot(aes(NumberOfInteractions2,mean_mean_abs, group=Dataset, col=Dataset, fill=Dataset)) +
+  labs(y="Mean interaction strength", x="Number of interactions", col="", fill="", tag="c")+
+  standard_theme(legend = "bottom") +
+  # theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+  geom_ribbon(data=newdat.fig4.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", Response=="Mean interaction strength"),
+              aes(y=fit, ymin=lwr, ymax=upr), alpha=0.1, col=NA) +
+  geom_line(data=newdat.fig4.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", Response=="Mean interaction strength"),
+            aes(y=fit)) +
+  geom_point(size=2.5, col="black", shape=21) + 
+  scale_color_manual(values = fig4cols, aesthetics = c("col","fill")) +
+  facet_wrap(~Dataset)+
+  guides(col=guide_legend(nrow=2,byrow=TRUE))
+
+
+dd_timepoints.supl <- dd_timepoints %>%
+  dplyr::mutate(percentData = case_when(percentData==8.3 ~ "1/12",
+                                        percentData==16.7 ~ "2/12",
+                                        percentData==25 ~ "3/12",
+                                        percentData==50 ~ "6/12",
+                                        percentData==75 ~ "9/12",
+                                        percentData==100 ~ "12/12"),
+                percentData = factor(percentData, levels = c("12/12", "9/12", "6/12", 
+                                                             "3/12", "2/12", "1/12"))) 
+
+newdat.reduced.timepoints.supl <- newdat.reduced.timepoints %>%
+  dplyr::mutate(percentData = case_when(percentData==8.3 ~ "1/12",
+                                        percentData==16.7 ~ "2/12",
+                                        percentData==25 ~ "3/12",
+                                        percentData==50 ~ "6/12",
+                                        percentData==75 ~ "9/12",
+                                        percentData==100 ~ "12/12"),
+                percentData = factor(percentData, levels = c("12/12", "9/12", "6/12", 
+                                                             "3/12", "2/12", "1/12")))
+
+
+fig4a1.tp <-
+  dd_timepoints.supl %>%
+  dplyr::filter(step==12) %>%
+  ggplot(aes(NumberOfInteractions, medianmedianRMSE, group=percentData, col=percentData, fill=percentData)) +
+  labs(x="Number of interactions", y="Forecast error (RMSE)", tag="d")  +
+  standard_theme(legend = "none") +
+  # theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+  geom_ribbon(data=newdat.reduced.timepoints.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", Response=="Forecast error (RMSE)"),
+              aes(y=fit, ymin=lwr, ymax=upr), alpha=0.1, col=NA) +
+  geom_line(data=newdat.reduced.timepoints.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", Response=="Forecast error (RMSE)"),
+            aes(y=fit)) +
+  geom_point(size=2.5, col="black", shape=21)  +
+  scale_color_manual(values = secondrow2, aesthetics = c("col","fill")) +
+  facet_wrap(~paste0("Prop. time points: ",percentData))
+
+
+fig4b1.tp <- dd_timepoints.supl %>%
+  dplyr::filter(step==12) %>%
+  ggplot(aes(mean_mean_abs, medianmedianRMSE, group=percentData, col=as.factor(percentData), fill=as.factor(percentData))) +
+  labs(x="Mean interaction strength", y="Forecast error (RMSE)", tag="e")  +
+  standard_theme(legend = "none") +
+  # theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+  geom_ribbon(data=newdat.reduced.timepoints.supl %>% dplyr::filter(Regressor=="mean_mean_abs", Response=="Forecast error (RMSE)"),
+              aes(y=fit, ymin=lwr, ymax=upr), alpha=0.1, col=NA) +
+  geom_line(data=newdat.reduced.timepoints.supl %>% dplyr::filter(Regressor=="mean_mean_abs", Response=="Forecast error (RMSE)"),
+            aes(y=fit)) +
+  geom_point(size=2.5, col="black", shape=21)  +
+  scale_color_manual(values = secondrow2, aesthetics = c("col","fill")) +
+  facet_wrap(~paste0("Prop. time points: ",percentData))
+
+fig4d1.tp <- dd_timepoints.supl %>%
+  dplyr::filter(step==12) %>%
+  rename(NumberOfInteractions2=NumberOfInteractions) %>%
+  ggplot(aes(NumberOfInteractions2,mean_mean_abs, group=percentData, col=as.factor(percentData), fill=as.factor(percentData))) +
+  labs(y="Mean interaction strength", x="Number of interactions",
+       fill="Proportion of time points", col="Proportion of time points", tag="f")+
+  standard_theme(legend = "bottom") +
+  # theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+  geom_ribbon(data=newdat.reduced.timepoints.supl %>% dplyr::filter(Regressor=="NumberOfInteractions", 
+                                                                    Response=="Mean interaction strength"),
+              aes(y=fit, ymin=lwr, ymax=upr), alpha=0.1, col=NA) +
+  geom_line(data=newdat.reduced.timepoints.supl %>% dplyr::filter(Regressor=="NumberOfInteractions",
+                                                                  Response=="Mean interaction strength"),
+            aes(y=fit)) +
+  geom_point(size=2.5, col="black", shape=21)  +
+  scale_color_manual(values = secondrow2, aesthetics = c("col","fill")) +
+  facet_wrap(~paste0("Prop. time points: ",percentData))
+
+(fig4a1/fig4b1/fig4d1) | (fig4a1.tp/fig4b1.tp/fig4d1.tp)
+```
+
+#### Scatter plots 1 day ahead forecast vs interactions
+
+
+```{r, fig.height=3, fig.width=8}
+ddstep1 <- full_join(FullForecastsSummstep1, NumInt)
+ddstep1 <- full_join(ddstep1, InteractionsElnet0_9Summ) %>%
+  dplyr::mutate(Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"))
+
+m.rmse.numint.perc100step1 <- lm(medianRMSE ~ NumberOfInteractions, data = ddstep1)
+
+m.rmse.meanint.perc100step1 <- lm(medianRMSE ~ mean_mean_abs, data = ddstep1)
+
+m.numint.meanint.perc100step1 <- lm(mean_mean_abs ~ NumberOfInteractions, data = ddstep1)
+
+
+ddstep1 %>%
+  ggplot(aes(NumberOfInteractions, medianRMSE)) +
+  labs(x="Number of interactions", y="Forecast error (RMSE)", tag="a")  +
+  standard_theme2(legend = "none") +
+  geom_smooth(method = "lm", col="black", alpha=0.2, linewidth=.5)+
+  geom_point(aes(col=Target2, fill=Target2), size=2.5, col="black", shape=21) +
+  scale_color_manual(values = palette, aesthetics = c("fill","col")) +
+
+ddstep1 %>%
+  ggplot(aes(mean_mean_abs, medianRMSE)) +
+  labs(x="Mean interaction strength", y="Forecast error (RMSE)", tag="b")  +
+  standard_theme2(legend = "right") +
+  geom_smooth(method = "lm", col="black", alpha=0.2, linewidth=.5)+
+  scale_color_manual(values = palette, aesthetics = c("fill","col")) +
+  geom_point(aes(col=Target2, fill=Target2), size=2.5, col="black", shape=21) 
+```
+
+
+#### Table: Interactions vs RMSE with 1 day ahead
+
+
+```{r}
+dd.slopes.1day <- data.frame(Response = rep(c("Forecast error (RMSE)","Forecast error (RMSE)","Mean interaction strength"), each=2),
+                             Covariate = c("Intercept","Number of interactions",
+                                           "Intercept","Mean interaction strength",
+                                           "Intercept","Number of interactions"),
+                             Estimate = c(coef(m.rmse.numint.perc100step1), 
+                                          coef(m.rmse.meanint.perc100step1),
+                                          coef(m.numint.meanint.perc100step1)),
+                             DF = summary(m.rmse.numint.perc100step1)$df[2],
+                             SE = c(summary(m.rmse.numint.perc100step1)$coef[,2,drop = FALSE],
+                                    summary(m.rmse.meanint.perc100step1)$coef[,2,drop = FALSE],
+                                    summary(m.numint.meanint.perc100step1)$coef[,2,drop = FALSE]),
+                             Test = "t",
+                             Test.value = c(summary(m.rmse.numint.perc100step1)$coef[,3,drop = FALSE],
+                                            summary(m.rmse.meanint.perc100step1)$coef[,3,drop = FALSE],
+                                            summary(m.numint.meanint.perc100step1)$coef[,3,drop = FALSE]),
+                             p.value = c(summary(m.rmse.numint.perc100step1)$coef[,4,drop = FALSE],
+                                         summary(m.rmse.meanint.perc100step1)$coef[,4,drop = FALSE],
+                                         summary(m.numint.meanint.perc100step1)$coef[,4,drop = FALSE]),
+                             lower = c(confint(m.rmse.numint.perc100step1)[,1],
+                                       confint(m.rmse.meanint.perc100step1)[,1],
+                                       confint(m.numint.meanint.perc100step1)[,1]),
+                             upper = c(confint(m.rmse.numint.perc100step1)[,2],
+                                       confint(m.rmse.meanint.perc100step1)[,2],
+                                       confint(m.numint.meanint.perc100step1)[,2]))
+
+rownames(dd.slopes.1day)<- NULL
+
+dd.slopes.1day$p.value <- ifelse(dd.slopes.1day$p.value<0.0001, "<0.0001",
+												 sprintf("%.4f", round(dd.slopes.1day$p.value,4)))
+
+dd.slopes.1day <- dd.slopes.1day %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3),
+                lower = round(lower,3),
+                upper = round(upper,3))
+# write.csv(dd.slopes.1day, "dd.slopes.1day.csv")
+dd.slopes.1day
+```
+
+
+
