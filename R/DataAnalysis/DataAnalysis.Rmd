@@ -3047,7 +3047,7 @@ simplot2 <- ForecastsSumm2 %>%
 
 ### Figure 
 
-```{r, fig.height=9, fig.width=10, warning=FALSE}
+```{r Figure2, fig.height=11, fig.width=10, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
 ## The results of the simulations are loaded in above
 
 ForecastsSumm <- Forecasts %>%
@@ -3221,7 +3221,7 @@ p.leg <- get_legend(p3e+theme(legend.position = "bottom") +
 
 ## Interaction figure 
 
-```{r, fig.height=8.5, fig.width=8.5, warning=FALSE}
+```{r Figure3, fig.height=10, fig.width=10, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
 # numint, freq
 
 p2.a <- dd_subsample %>%
@@ -3317,7 +3317,7 @@ p2.f <- dd_timepoints %>%
 
 ## Influence of sampling design on the detection of correlations between variables
 
-```{r, fig.height=6, fig.width=8, warning=FALSE}
+```{r Figure4, fig.height=7, fig.width=8, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
 secondrow <- c(`1/12 of time points` = "#1B9E77", 
                `2/12 of time points` = "#D95F02", `3/12 of time points` = "#7570B3", 
                `6/12 of time points` = "#E7298A", `9/12 of time points` = "#E6AB02", 
@@ -3380,7 +3380,7 @@ fig4a2.tp.2 <- dd.slopes.tp %>%
   coord_flip()+
   scale_x_discrete(limits=rev) +
   scale_color_manual(values = secondrow2, aesthetics = c("col","fill")) +
-  labs(y="Slope between the number of\ninteractions and forecast error", x="Proportion ot time points", tag = "c")+
+  labs(y="Slope between the number of\ninteractions and forecast error", x="Proportion of time\npoints", tag = "c")+
   ylim(-0.075,0.08) +
   theme(axis.title.x = element_blank())
 
