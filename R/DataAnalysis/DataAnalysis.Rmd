@@ -50,6 +50,7 @@ library(viridis)
 library(lattice)
 library(odin)
 library(kableExtra)
+library(randomForest)
 
 options(dplyr.summarise.inform = FALSE)
 options(tidyverse.quiet = TRUE)
@@ -770,7 +771,7 @@ pred <- libraries$pred
 ```
 
 
-### 1 step ahead
+### 1 step ahead (1 day)
 
 ```{r GREForecastDaily1step_47fold, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 set.seed(1)
@@ -802,7 +803,7 @@ save(GREForecastDaily1step47fold, file = here("Data/forecast_data/GREForecastDai
 ```
 
 
-### 12 steps ahead
+### 12 steps ahead (12 days ahead)
 
 ```{r GREForecastDaily12steps_47fold, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 set.seed(1)
@@ -835,7 +836,7 @@ save(GREForecastDaily12steps47fold, file = here("Data/forecast_data/GREForecastD
 
 
 
-## Reduced sampling frequency (LOOCV)
+## Reduced sampling frequency (LOOCV), 12 days ahead
 
 ```{r subsample_prep, message=FALSE, warning=FALSE, cache=TRUE}
 targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
@@ -852,6 +853,7 @@ predictor_combinations <- predictor_combinator(possible_predictors, which=which,
 
 ### Daily sampling, 12 steps ahead
 
+#### Multiview EDM
 
 ```{r GREForecastDaily_subsample1day12steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 set.seed(1)
@@ -874,9 +876,31 @@ GREForecastDaily_subsample1day12steps <- do.call("rbind", GREForecastDaily_subsa
 save(GREForecastDaily_subsample1day12steps, file = here("Data/forecast_data/GREForecastDaily_subsample1day12steps.RData"))
 ```
 
+#### Random Forest
 
+```{r GRE_RF_subsample1day12steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_1day_12steps_RF.txt'
+file.create(write.file)
+
+GRE_RF_subsample1day12steps <- lapply(1:length(ddHF_GRE2_1day), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_1day)), write.file, append = T)
+  dd <- forecasting_RF_loocv(data = ddHF_GRE2_1day[[i]], steps_ahead = 12, 
+                             predictors = possible_predictors, targets = targets, 
+                             max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GRE_RF_subsample1day12steps <- do.call("rbind", GRE_RF_subsample1day12steps)
+
+save(GRE_RF_subsample1day12steps, file = here("Data/forecast_data/GRE_RF_subsample1day12steps.RData"))
+```
 
 ### 3 days sampling interval, 4 steps ahead
+
+#### Multiview EDM
 
 ```{r GREForecastDaily_subsample3days4steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 set.seed(1)
@@ -899,7 +923,33 @@ GREForecastDaily_subsample3days4steps <- do.call("rbind", GREForecastDaily_subsa
 save(GREForecastDaily_subsample3days4steps, file = here("Data/forecast_data/GREForecastDaily_subsample3days4steps.RData"))
 ```
 
+
+#### Random Forest
+
+```{r GRE_RF_subsample3days4steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_3days_4steps_RF.txt'
+file.create(write.file)
+
+GRE_RF_subsample3days4steps <- lapply(1:length(ddHF_GRE2_3days), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_3days)), write.file, append = T)
+  dd <- forecasting_RF_loocv(data = ddHF_GRE2_3days[[i]], steps_ahead = 4, 
+                             predictors = possible_predictors, targets = targets, 
+                             max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GRE_RF_subsample3days4steps <- do.call("rbind", GRE_RF_subsample3days4steps)
+
+save(GRE_RF_subsample3days4steps, file = here("Data/forecast_data/GRE_RF_subsample3days4steps.RData"))
+```
+
+
 ### 6 days sampling interval, 2 steps ahead
+
+#### Multiview EDM
 
 ```{r GREForecastDaily_subsample6days2steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 set.seed(1)
@@ -922,7 +972,30 @@ GREForecastDaily_subsample6days2steps <- do.call("rbind", GREForecastDaily_subsa
 save(GREForecastDaily_subsample6days2steps, file = here("Data/forecast_data/GREForecastDaily_subsample6days2steps.RData"))
 ```
 
+#### Random Forest
+```{r GRE_RF_subsample6days2steps, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_6days_2steps_RF.txt'
+file.create(write.file)
+
+GRE_RF_subsample6days2steps <- lapply(1:length(ddHF_GRE2_6days), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_6days)), write.file, append = T)
+  dd <- forecasting_RF_loocv(data = ddHF_GRE2_6days[[i]], steps_ahead = 2, 
+                             predictors = possible_predictors, targets = targets, 
+                             max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GRE_RF_subsample6days2steps <- do.call("rbind", GRE_RF_subsample6days2steps)
+
+save(GRE_RF_subsample6days2steps, file = here("Data/forecast_data/GRE_RF_subsample6days2steps.RData"))
+```
+
 ### 12 days sampling interval, 1 step ahead
+
+#### Multiview EDM
 
 ```{r GREForecastDaily_subsample12days1step, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 set.seed(1)
@@ -945,9 +1018,293 @@ GREForecastDaily_subsample12days1step <- do.call("rbind", GREForecastDaily_subsa
 save(GREForecastDaily_subsample12days1step, file = here("Data/forecast_data/GREForecastDaily_subsample12days1step.RData"))
 ```
 
+#### Random Forest
+
+```{r GRE_RF_subsample12days1step, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'R_prog_fore_sub_12days_1step_RF.txt'
+file.create(write.file)
+
+GRE_RF_subsample12days1step <- lapply(1:length(ddHF_GRE2_12days), function(i){
+  write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_12days)), write.file, append = T)
+  dd <- forecasting_RF_loocv(data = ddHF_GRE2_12days[[i]], steps_ahead = 1, 
+                             predictors = possible_predictors, targets = targets, 
+                             max_lag = 3, write.file=write.file)
+  dd$subsample <- i
+  dd
+}) 
+
+GRE_RF_subsample12days1step <- do.call("rbind", GRE_RF_subsample12days1step)
+
+save(GRE_RF_subsample12days1step, file = here("Data/forecast_data/GRE_RF_subsample12days1step.RData"))
+```
+
+### Controlled time window (i.e. varying sample size)
+
+```{r}
+index12 <- seq(1,973,12)
+index6 <- seq(1,973,6)
+index3 <- seq(1,973,3)
+index1 <- seq(1,973,1)
+
+ddHF_GRE2_12days_fullSample <- ddHF_GRE2[index12,]
+ddHF_GRE2_6days_fullSample <- ddHF_GRE2[index6,]
+ddHF_GRE2_3days_fullSample <- ddHF_GRE2[index3,]
+ddHF_GRE2_1day_fullSample <- ddHF_GRE2[index1,]
+
+LeaveSomeOut <- ddHF_GRE2_12days_fullSample$time[3:(nrow(ddHF_GRE2_12days_fullSample)-1)]
+```
+
+#### Daily sampling, 12 steps ahead, Multiview EDM
+
+```{r GREForecast_Freq1over1_12steps_unreduced, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'Forecast_Freq1over1_12steps_unreduced.txt'
+file.create(write.file)
+
+write(paste0("Analysis started at: ", Sys.time()), write.file, append = T)
+
+GREForecast_Freq1over1_12steps_unreduced <- 
+  forecasting_loocv(data = ddHF_GRE2_1day_fullSample, steps_ahead = 12, 
+                    E = 2, predictors = possible_predictors,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file,
+                    LeaveSomeOut = LeaveSomeOut)
+
+save(GREForecast_Freq1over1_12steps_unreduced, file = here("Data/forecast_data/GREForecast_Freq1over1_12steps_unreduced.RData"))
+```
+
+#### 3 days sampling interval, 4 steps ahead, Multiview EDM
+
+```{r GREForecast_Freq1over3_4steps_unreduced, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'Forecast_Freq1over3_4steps_unreduced.txt'
+file.create(write.file)
+
+write(paste0("Analysis started at: ", Sys.time()), write.file, append = T)
+
+GREForecast_Freq1over3_4steps_unreduced <- 
+  forecasting_loocv(data = ddHF_GRE2_3days_fullSample, steps_ahead = 4, 
+                    E = 2, predictors = possible_predictors,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file,
+                    LeaveSomeOut = LeaveSomeOut)
+
+save(GREForecast_Freq1over3_4steps_unreduced, file = here("Data/forecast_data/GREForecast_Freq1over3_4steps_unreduced.RData"))
+```
+
+#### 6 days sampling interval, 2 steps ahead, Multiview EDM
+
+```{r GREForecast_Freq1over6_2steps_unreduced, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'Forecast_Freq1over6_2steps_unreduced.txt'
+file.create(write.file)
+
+write(paste0("Analysis started at: ", Sys.time()), write.file, append = T)
+
+GREForecast_Freq1over6_2steps_unreduced <- 
+  forecasting_loocv(data = ddHF_GRE2_6days_fullSample, steps_ahead = 2, 
+                    E = 2, predictors = possible_predictors,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file,
+                    LeaveSomeOut = LeaveSomeOut)
+
+save(GREForecast_Freq1over6_2steps_unreduced, file = here("Data/forecast_data/GREForecast_Freq1over6_2steps_unreduced.RData"))
+```
+
+#### 12 days sampling interval, 1 step ahead, Multiview EDM
+
+```{r GREForecast_Freq1over12_1step_unreduced, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+write.file = 'Forecast_Freq1over12_1step_unreduced.txt'
+file.create(write.file)
+
+write(paste0("Analysis started at: ", Sys.time()), write.file, append = T)
+
+GREForecast_Freq1over12_1step_unreduced <- 
+  forecasting_loocv(data = ddHF_GRE2_12days_fullSample, steps_ahead = 1, 
+                    E = 2, predictors = possible_predictors,
+                    pred_combs = predictor_combinations, 
+                    targets = targets, max_lag = 3, write.file=write.file,
+                    LeaveSomeOut = LeaveSomeOut)
+
+save(GREForecast_Freq1over12_1step_unreduced, file = here("Data/forecast_data/GREForecast_Freq1over12_1step_unreduced.RData"))
+```
 
 
-## Reduced time points forecasting
+### Forecast horizon analysis: 24-days ahead forecasts
+
+#### Daily sampling, 24 steps ahead, Multiview EDM
+
+```{r ForecastHorizon_dailyData, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+SamplingInterval <- 1
+daysAhead <- 24
+
+for(d in daysAhead) {
+  
+  write.file = "FH_DailyData.txt"
+  file.create(write.file)
+
+  write(paste0("Now forecasting ", d, " days ahead",
+               "; The start time is ", Sys.time()), 
+        write.file, append = T) 
+  old1 <- Sys.time()
+  
+  ForecastHorizon <- lapply(1:length(ddHF_GRE2_1day), function(i){
+    write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_1day),
+                 "; The start time is ", Sys.time()),
+          write.file, append = T)
+    old2 <- Sys.time()
+    dd <- forecasting_loocv_v2(data = ddHF_GRE2_1day[[i]], 
+                               steps_ahead = d/SamplingInterval, daysAhead = d, 
+                               E = 2, predictors = possible_predictors, 
+                               pred_combs = predictor_combinations, 
+                               targets = targets, max_lag = 3, write.file=write.file)
+    write(paste0("Time needed for subset of the data: ", Sys.time() - old2, "\n"), write.file, append = T)
+    dd$subsample <- i
+    return(dd)
+    
+  })
+  write(paste0("Time needed for forecasting the mentioned days ahead: ", Sys.time() - old1, "\n"), write.file, append = T)
+  ForecastHorizon <- do.call("rbind", ForecastHorizon)
+  ForecastHorizon$daysAhead <- d
+  namedd <- paste0("Data/forecast_data/Horizon/DailyData_DaysAhead",d,".RData")
+  save(ForecastHorizon, file = here(namedd))
+}
+```
+
+#### 3 Days sampling interval, 8 steps ahead, Multiview EDM
+
+```{r ForecastHorizon_3daysFreq, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+SamplingInterval <- 3
+daysAhead <- 24
+
+for(d in daysAhead) {
+  
+  write.file = "FH_3DaysData.txt"
+  file.create(write.file)
+
+  write(paste0("Now forecasting ", d, " days ahead",
+               "; The start time is ", Sys.time()), 
+        write.file, append = T) 
+  old1 <- Sys.time()
+  
+  ForecastHorizon <- lapply(1:length(ddHF_GRE2_3days), function(i){
+    write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_3days),
+                 "; The start time is ", Sys.time()),
+          write.file, append = T)
+    old2 <- Sys.time()
+    dd <- forecasting_loocv_v2(data = ddHF_GRE2_3days[[i]], 
+                               steps_ahead = d/SamplingInterval, daysAhead = d, 
+                               E = 2, predictors = possible_predictors, 
+                               pred_combs = predictor_combinations, 
+                               targets = targets, max_lag = 3, write.file=write.file)
+    write(paste0("Time needed for subset of the data: ", Sys.time() - old2, "\n"), write.file, append = T)
+    dd$subsample <- i
+    return(dd)
+    
+  })
+  write(paste0("Time needed for forecasting the mentioned days ahead: ", Sys.time() - old1, "\n"), write.file, append = T)
+  ForecastHorizon <- do.call("rbind", ForecastHorizon)
+  ForecastHorizon$daysAhead <- d
+  namedd <- paste0("Data/forecast_data/Horizon/3DaysData_DaysAhead",d,".RData")
+  save(ForecastHorizon, file = here(namedd))
+}
+```
+
+#### 6 Days sampling interval, 4 steps ahead, Multiview EDM
+
+```{r ForecastHorizon_6daysFreq, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+SamplingInterval <- 6
+daysAhead <- 24
+
+for(d in daysAhead) {
+  
+  write.file = "FH_6DaysData.txt"
+  file.create(write.file)
+
+  write(paste0("Now forecasting ", d, " days ahead",
+               "; The start time is ", Sys.time()), 
+        write.file, append = T) 
+  old1 <- Sys.time()
+  
+  ForecastHorizon <- lapply(1:length(ddHF_GRE2_6days), function(i){
+    write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_6days),
+                 "; The start time is ", Sys.time()),
+          write.file, append = T)
+    old2 <- Sys.time()
+    dd <- forecasting_loocv_v2(data = ddHF_GRE2_6days[[i]], 
+                               steps_ahead = d/SamplingInterval, daysAhead = d, 
+                               E = 2, predictors = possible_predictors, 
+                               pred_combs = predictor_combinations, 
+                               targets = targets, max_lag = 3, write.file=write.file)
+    write(paste0("Time needed for subset of the data: ", Sys.time() - old2, "\n"), write.file, append = T)
+    dd$subsample <- i
+    return(dd)
+    
+  })
+  write(paste0("Time needed for forecasting the mentioned days ahead: ", Sys.time() - old1, "\n"), write.file, append = T)
+  ForecastHorizon <- do.call("rbind", ForecastHorizon)
+  ForecastHorizon$daysAhead <- d
+  namedd <- paste0("Data/forecast_data/Horizon/6DaysData_DaysAhead",d,".RData")
+  save(ForecastHorizon, file = here(namedd))
+}
+```
+
+#### 12 Days sampling interval, 2 steps ahead, Multiview EDM
+
+```{r ForecastHorizon_12daysFreq, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+set.seed(1)
+
+SamplingInterval <- 12
+daysAhead <- 24
+
+for(d in daysAhead) {
+  
+  write.file = "FH_12DaysData.txt"
+  file.create(write.file)
+
+  write(paste0("Now forecasting ", d, " days ahead",
+               "; The start time is ", Sys.time()), 
+        write.file, append = T) 
+  old1 <- Sys.time()
+  
+  ForecastHorizon <- lapply(1:length(ddHF_GRE2_12days), function(i){
+    write(paste0("Subset of data number: ", i, " out of ", length(ddHF_GRE2_12days),
+                 "; The start time is ", Sys.time()),
+          write.file, append = T)
+    old2 <- Sys.time()
+    dd <- forecasting_loocv_v2(data = ddHF_GRE2_12days[[i]], 
+                               steps_ahead = d/SamplingInterval, daysAhead = d, 
+                               E = 2, predictors = possible_predictors, 
+                               pred_combs = predictor_combinations, 
+                               targets = targets, max_lag = 3, write.file=write.file)
+    write(paste0("Time needed for subset of the data: ", Sys.time() - old2, "\n"), write.file, append = T)
+    dd$subsample <- i
+    return(dd)
+    
+  })
+  write(paste0("Time needed for forecasting the mentioned days ahead: ", Sys.time() - old1, "\n"), write.file, append = T)
+  ForecastHorizon <- do.call("rbind", ForecastHorizon)
+  ForecastHorizon$daysAhead <- d
+  namedd <- paste0("Data/forecast_data/Horizon/12DaysData_DaysAhead",d,".RData")
+  save(ForecastHorizon, file = here(namedd))
+}
+```
+
+
+## Reduced time points forecasting, 12 days ahead
 
 ```{r subsample_prep2, message=FALSE, warning=FALSE, cache=TRUE}
 targets <- c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6", 
@@ -4063,5 +4420,433 @@ dd.slopes.1day <- dd.slopes.1day %>%
 dd.slopes.1day
 ```
 
+### S2.4:  Robustness analyses
 
+#### S2.4.1: Random Forest forecast
+
+##### Figure: Random Forest forecast
+
+```{r, fig.height=4.5, fig.width=12}
+load(here("Data/forecast_data/GRE_RF_subsample12days1step.RData"))
+load(here("Data/forecast_data/GRE_RF_subsample6days2steps.RData"))
+load(here("Data/forecast_data/GRE_RF_subsample3days4steps.RData"))
+load(here("Data/forecast_data/GRE_RF_subsample1day12steps.RData"))
+
+GRE_RF_subsample12days1step$freq = 1/12
+GRE_RF_subsample6days2steps$freq = 1/6
+GRE_RF_subsample3days4steps$freq = 1/3
+GRE_RF_subsample1day12steps$freq = 1/1
+
+RF <- rbind(GRE_RF_subsample12days1step,
+            GRE_RF_subsample6days2steps,
+            GRE_RF_subsample3days4steps,
+            GRE_RF_subsample1day12steps)
+
+palette <- c(brewer.pal(name="Paired", n = 12),"grey","black")
+
+RF <- RF %>%
+  dplyr::mutate(Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"),
+                Plankton = ifelse(Target %in% c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6"), 
+                                  "Phytoplankton", "Zooplankton"),
+                log10Freq = log10(freq)) %>%
+  group_by(Target, freq,log10Freq,Plankton,Target2) %>%
+  summarise(medianRMSE=median(RMSE))
+
+
+
+m.sampling.RMSE.RF <- lmer(medianRMSE ~ log10Freq*Plankton + (1+log10Freq|Target), data = RF)
+
+newdat.sampling.freq.grid.RF<- expand.grid(log10Freq=seq(min(RF$log10Freq),
+                                                  max(RF$log10Freq),
+                                                  length.out = 100),
+                                         Plankton = unique(RF$Plankton))
+
+newdat.sampling.freq.RF <- conf_interval(m.sampling.RMSE.RF, newdat.sampling.freq.grid.RF, "medianRMSE", "Forecast error (RMSE)")
+
+RF.a <- RF %>%
+  ggplot(aes(log10Freq,medianRMSE)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.sampling.freq.RF %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.sampling.freq.RF %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+            aes(y=fit, group=Plankton), col="black")+
+  labs(x=expression(log10(Sampling~frequency)~(samplings/day)), y="Forecast error (RMSE)",fill="Target", tag="a")+
+  scale_x_continuous(breaks = log10(c(1/12,1/6,1/3,1)),
+                     labels = c("log10(1/12)","log10(1/6)","log10(1/3)","log10(1/1)")) +
+  facet_wrap(~Plankton) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+dd_subsample_formods_summ.RF <- RF %>%
+  group_by(Target2) %>%
+  mutate(min_rmse = min(medianRMSE)) %>%
+  filter(medianRMSE == min_rmse) %>%
+  full_join(generation_times3 %>% dplyr::select(net_growth_rate,Target))
+
+
+RF.b <- dd_subsample_formods_summ.RF %>%
+  ggplot(aes(net_growth_rate,freq)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="(Maximum net) Growth rate",fill="Target", tag="b") +
+  geom_ribbon(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+              aes(growth_rate,SamplingFreq,ymin=SamplingFreq-sd_freq, ymax=SamplingFreq+sd_freq),
+              col=NA,alpha=0.2)+
+  geom_point(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+             aes(growth_rate,SamplingFreq),
+             size=2.3) +
+  geom_line(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+            aes(growth_rate,SamplingFreq))+
+  scale_y_continuous(breaks = c(0,1/12,1/4,1/2,1,2),
+                     labels = c(0,"1/12","1/4","1/2","1",2)) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "right")
+
+
+RF.a + RF.b + plot_layout(widths = c(2,1))
+```
+
+##### Table: Random Forest forecast
+
+
+```{r}
+freq.reg.tab.RF <- data.frame(MainExpVar = "Sampling frequency",
+                              Covariate = c("Intercept","Sampl. freq","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                              Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                              Estimate = c(fixef(m.sampling.RMSE.RF),as.data.frame(VarCorr(m.sampling.RMSE.RF))$sdcor[1:2]),
+                              DF = c(round(summary(m.sampling.RMSE.RF)$coef[,3,drop = FALSE],0),NA,NA),
+                              SE = c(summary(m.sampling.RMSE.RF)$coef[,2,drop = FALSE],NA,NA),
+                              Test = c(rep("\\textit{t}",4),NA,NA),
+                              Test.value = c(summary(m.sampling.RMSE.RF)$coef[,4,drop = FALSE],NA,NA),
+                              p.value = c(summary(m.sampling.RMSE.RF)$coef[, 5, drop = FALSE],NA,NA))
+
+freq.anova.tab.RF <- data.frame(MainExpVar = "Sampling frequency",
+                                Covariate = c("Sampl. freq","Plankton","Interaction"),
+                                Type = "Sum of sq.",
+                                Estimate = anova(m.sampling.RMSE.RF)[,1],
+                                DF= paste(anova(m.sampling.RMSE.RF)[,3],round(anova(m.sampling.RMSE.RF)[,4],1), sep = ", "),
+                                SE = NA,
+                                Test = "\\textit{F}",
+                                Test.value = anova(m.sampling.RMSE.RF)[,5],
+                                p.value = anova(m.sampling.RMSE.RF)[,6])
+
+forecast.tab.RF <- rbind(freq.reg.tab.RF,
+                         freq.anova.tab.RF)
+rownames(forecast.tab.RF)<- NULL
+
+
+forecast.tab.RF$p.value <- ifelse(forecast.tab.RF$p.value<0.0001, "<0.0001",
+                                  sprintf("%.4f", round(forecast.tab.RF$p.value,4)))
+
+forecast.tab.RF <- forecast.tab.RF %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+# write.csv(forecast.tab.RF, "forecast.tab.RF.csv")
+forecast.tab.RF
+```
+
+
+
+#### S2.4.2: Controlled time window
+
+##### Figure: Controlled time window
+
+```{r, fig.height=4.5, fig.width=12}
+load(here("Data/forecast_data/GREForecast_Freq1over12_1step_unreduced.RData"))
+load(here("Data/forecast_data/GREForecast_Freq1over6_2steps_unreduced.RData"))
+load(here("Data/forecast_data/GREForecast_Freq1over3_4steps_unreduced.RData"))
+load(here("Data/forecast_data/GREForecast_Freq1over1_12steps_unreduced.RData"))
+
+GREForecast_Freq1over12_1step_unreduced$freq <- 1/12
+GREForecast_Freq1over6_2steps_unreduced$freq <- 1/6
+GREForecast_Freq1over3_4steps_unreduced$freq <- 1/3
+GREForecast_Freq1over1_12steps_unreduced$freq <- 1/1
+
+TimeWindow <- rbind(GREForecast_Freq1over12_1step_unreduced,
+                    GREForecast_Freq1over6_2steps_unreduced,
+                    GREForecast_Freq1over3_4steps_unreduced,
+                    GREForecast_Freq1over1_12steps_unreduced)
+
+TimeWindow <- TimeWindow %>%
+  group_by(Target, freq) %>%
+  dplyr::mutate(Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"),
+                Plankton = ifelse(Target %in% c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6"), 
+                                  "Phytoplankton", "Zooplankton"),
+                log10Freq = log10(freq),
+                freq.fac = as.factor(log10Freq)) %>%
+  group_by(Target, freq,log10Freq,Plankton,Target2,freq.fac) %>%
+  summarise(medianRMSE=median(RMSE))
+
+m.sampling.RMSE.TW <- lmer(medianRMSE ~ log10Freq*Plankton + (1+log10Freq|Target2), data = TimeWindow)
+
+newdat.sampling.freq.grid.TW<- expand.grid(log10Freq=seq(min(TimeWindow$log10Freq),
+                                                         max(TimeWindow$log10Freq),
+                                                         length.out = 100),
+                                           Plankton = unique(TimeWindow$Plankton))
+
+newdat.sampling.freq.grid.TW <- conf_interval(m.sampling.RMSE.TW, newdat.sampling.freq.grid.TW, "medianRMSE", "Forecast error (RMSE)")
+
+TimeWindow.a <- TimeWindow %>%
+  ggplot(aes(log10Freq,medianRMSE)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.sampling.freq.grid.TW %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.sampling.freq.grid.TW %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+            aes(y=fit, group=Plankton), col="black")+
+  labs(x=expression(log10(Sampling~frequency)~(samplings/day)), y="Forecast error (RMSE)",fill="Target", tag="a")+
+  scale_x_continuous(breaks = log10(c(1/12,1/6,1/3,1)),
+                     labels = c("log10(1/12)","log10(1/6)","log10(1/3)","log10(1/1)")) +
+  facet_wrap(~Plankton) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+dd_subsample_formods_summ.TW <- TimeWindow %>%
+  group_by(Target2) %>%
+  mutate(min_rmse = min(medianRMSE)) %>%
+  filter(medianRMSE == min_rmse) %>%
+  full_join(generation_times3 %>% dplyr::select(net_growth_rate,Target))
+
+
+TimeWindow.b <- dd_subsample_formods_summ.TW %>%
+  ggplot(aes(net_growth_rate,freq)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="(Maximum net) Growth rate",fill="Target", tag="b") +
+  geom_ribbon(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+              aes(growth_rate,SamplingFreq,ymin=SamplingFreq-sd_freq, ymax=SamplingFreq+sd_freq),
+              col=NA,alpha=0.2)+
+  geom_point(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+             aes(growth_rate,SamplingFreq),
+             size=2.3) +
+  geom_line(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+            aes(growth_rate,SamplingFreq))+
+  scale_y_continuous(breaks = c(0,1/12,1/4,1/2,1,2),
+                     labels = c(0,"1/12","1/4","1/2","1",2)) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "right")
+
+
+TimeWindow.a + TimeWindow.b + plot_layout(widths = c(2,1))
+```
+
+##### Table: Controlled time window
+
+```{r}
+freq.reg.tab.TW <- data.frame(MainExpVar = "Sampling frequency",
+                           Covariate = c("Intercept","Sampl. freq","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.sampling.RMSE.TW),as.data.frame(VarCorr(m.sampling.RMSE.TW))$sdcor[1:2]),
+                           DF = c(round(summary(m.sampling.RMSE.TW)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.sampling.RMSE.TW)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.sampling.RMSE.TW)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.sampling.RMSE.TW)$coef[, 5, drop = FALSE],NA,NA))
+
+freq.anova.tab.TW <- data.frame(MainExpVar = "Sampling frequency",
+                             Covariate = c("Sampl. freq","Plankton","Interaction"),
+                             Type = "Sum of sq.",
+                             Estimate = anova(m.sampling.RMSE.TW)[,1],
+                             DF= paste(anova(m.sampling.RMSE.TW)[,3],round(anova(m.sampling.RMSE.TW)[,4],1), sep = ", "),
+                             SE = NA,
+                             Test = "\\textit{F}",
+                             Test.value = anova(m.sampling.RMSE.TW)[,5],
+                             p.value = anova(m.sampling.RMSE.TW)[,6])
+
+forecast.tab.TW <- rbind(freq.reg.tab.TW,
+                         freq.anova.tab.TW)
+rownames(forecast.tab.TW)<- NULL
+
+
+forecast.tab.TW$p.value <- ifelse(forecast.tab.TW$p.value<0.0001, "<0.0001",
+                                  sprintf("%.4f", round(forecast.tab.TW$p.value,4)))
+
+forecast.tab.TW <- forecast.tab.TW %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+# write.csv(forecast.tab.TW, "forecast.tab.TW.csv")
+forecast.tab.TW
+```
+
+#### S2.4.3: Forecast horizon, 24 days ahead forecasts
+
+##### Figure: Forecast horizon, 24 days ahead forecasts
+
+
+```{r, fig.height=4.5, fig.width=12}
+load(here("Data/forecast_data/Horizon/DailyData_DaysAhead24.RData"))
+ForecastHorizon$freq <- 1/1
+ddtemp <- ForecastHorizon
+
+load(here("Data/forecast_data/Horizon/3DaysData_DaysAhead24.RData"))
+ForecastHorizon$freq <- 1/3
+ddtemp <- rbind(ddtemp, ForecastHorizon)
+
+load(here("Data/forecast_data/Horizon/6DaysData_DaysAhead24.RData"))
+ForecastHorizon$freq <- 1/6
+ddtemp <- rbind(ddtemp, ForecastHorizon)
+
+load(here("Data/forecast_data/Horizon/12DaysData_DaysAhead24.RData"))
+ForecastHorizon$freq <- 1/12
+ForecastHorizon <- rbind(ddtemp, ForecastHorizon)
+
+ForecastHorizon <- ForecastHorizon %>%
+  group_by(Target, freq) %>%
+  dplyr::mutate(Target2 = case_when(Target == "cluster_1" ~ "Phytoplankton size bin 1",
+                                    Target == "cluster_2" ~ "Phytoplankton size bin 2",
+                                    Target == "cluster_3" ~ "Phytoplankton size bin 3",
+                                    Target == "cluster_4" ~ "Phytoplankton size bin 4",
+                                    Target == "cluster_5" ~ "Phytoplankton size bin 5",
+                                    Target == "cluster_6" ~ "Phytoplankton size bin 6",
+                                    Target == "calanoid_copepods" ~ "Calanoid copepods",
+                                    Target == "ciliates" ~ "Ciliates",
+                                    Target == "cyclopoid_copepods" ~ "Cyclopoid copepods",
+                                    Target == "daphnids" ~ "Daphnids",
+                                    Target == "nauplii" ~ "Nauplii",
+                                    Target == "rotifers" ~ "Rotifers"),
+                Plankton = ifelse(Target %in% c("cluster_1","cluster_2","cluster_3","cluster_4","cluster_5","cluster_6"), 
+                                  "Phytoplankton", "Zooplankton"),
+                log10Freq = log10(freq)) %>%
+  group_by(Target, freq,log10Freq,Plankton,Target2) %>%
+  summarise(medianRMSE=median(RMSE))
+
+m.sampling.RMSE.FH <- lmer(medianRMSE ~ log10Freq*Plankton + (1+log10Freq|Target), data = ForecastHorizon)
+
+newdat.sampling.freq.grid.FH<- expand.grid(log10Freq=seq(min(ForecastHorizon$log10Freq),
+                                                    max(ForecastHorizon$log10Freq),
+                                                    length.out = 100),
+                                           Plankton = unique(ForecastHorizon$Plankton))
+
+newdat.sampling.freq.grid.FH <- conf_interval(m.sampling.RMSE.FH, newdat.sampling.freq.grid.FH, "medianRMSE", "Forecast error (RMSE)")
+
+ForecastHorizon.a <- ForecastHorizon %>%
+  ggplot(aes(log10Freq,medianRMSE)) +
+  geom_hline(yintercept = 1, col="red", linetype=2)+
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  geom_ribbon(data=newdat.sampling.freq.grid.FH %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+              aes(ymin=lower, ymax=upper, y=fit, group=Plankton), col=NA, fill="grey", alpha=0.3)+
+  geom_line(data=newdat.sampling.freq.grid.FH %>% dplyr::filter(Response=="Forecast error (RMSE)"),
+            aes(y=fit, group=Plankton), col="black")+
+  labs(x=expression(log10(Sampling~frequency)~(samplings/day)), y="Forecast error (RMSE)",fill="Target", tag="a")+
+  scale_x_continuous(breaks = log10(c(1/12,1/6,1/3,1)),
+                     labels = c("log10(1/12)","log10(1/6)","log10(1/3)","log10(1/1)")) +
+  facet_wrap(~Plankton) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+dd_subsample_formods_summ.FH <- ForecastHorizon %>%
+  group_by(Target2) %>%
+  mutate(min_rmse = min(medianRMSE)) %>%
+  filter(medianRMSE == min_rmse) %>%
+  full_join(generation_times3 %>% dplyr::select(net_growth_rate,Target))
+
+
+ForecastHorizon.b <- dd_subsample_formods_summ.FH %>%
+  ggplot(aes(net_growth_rate,freq)) +
+  geom_point(aes(fill=Target2), 
+             # position = position_jitter(0.03), 
+             size=2.5, pch=21) +
+  labs(y="Optimal sampling\nfrequency (samplings/day)",
+       x="(Maximum net) Growth rate",fill="Target", tag="b") +
+  geom_ribbon(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+              aes(growth_rate,SamplingFreq,ymin=SamplingFreq-sd_freq, ymax=SamplingFreq+sd_freq),
+              col=NA,alpha=0.2)+
+  geom_point(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+             aes(growth_rate,SamplingFreq),
+             size=2.3) +
+  geom_line(data = ForecastsSumm2 %>% dplyr::filter(sd==60, n==75), 
+            aes(growth_rate,SamplingFreq))+
+  scale_y_continuous(breaks = c(0,1/12,1/4,1/2,1,2),
+                     labels = c(0,"1/12","1/4","1/2","1",2)) +
+  standard_theme2()+
+  scale_color_manual(values = palette, aesthetics = c("fill","col"))+
+  theme(legend.position = "right")
+
+
+ForecastHorizon.a + ForecastHorizon.b + plot_layout(widths = c(2,1))
+```
+
+##### Table: Forecast horizon, 24 days ahead forecasts
+
+
+```{r}
+freq.reg.tab.FH <- data.frame(MainExpVar = "Sampling frequency",
+                           Covariate = c("Intercept","Sampl. freq","Zooplankton","Interaction","Rand. int.","Rand. slope"),
+                           Type = c(rep("Fix. eff.",4),"Std. Dev.","Std. Dev."),
+                           Estimate = c(fixef(m.sampling.RMSE.FH),as.data.frame(VarCorr(m.sampling.RMSE.FH))$sdcor[1:2]),
+                           DF = c(round(summary(m.sampling.RMSE.FH)$coef[,3,drop = FALSE],0),NA,NA),
+                           SE = c(summary(m.sampling.RMSE.FH)$coef[,2,drop = FALSE],NA,NA),
+                           Test = c(rep("\\textit{t}",4),NA,NA),
+                           Test.value = c(summary(m.sampling.RMSE.FH)$coef[,4,drop = FALSE],NA,NA),
+                           p.value = c(summary(m.sampling.RMSE.FH)$coef[, 5, drop = FALSE],NA,NA))
+
+freq.anova.tab.FH <- data.frame(MainExpVar = "Sampling frequency",
+                             Covariate = c("Sampl. freq","Plankton","Interaction"),
+                             Type = "Sum of sq.",
+                             Estimate = anova(m.sampling.RMSE.FH)[,1],
+                             DF= paste(anova(m.sampling.RMSE.FH)[,3],round(anova(m.sampling.RMSE.FH)[,4],0), sep = ", "),
+                             SE = NA,
+                             Test = "\\textit{F}",
+                             Test.value = anova(m.sampling.RMSE.FH)[,5],
+                             p.value = anova(m.sampling.RMSE.FH)[,6])
+
+forecast.tab.FH <- rbind(freq.reg.tab.FH,
+                         freq.anova.tab.FH)
+rownames(forecast.tab.FH)<- NULL
+
+
+forecast.tab.FH$p.value <- ifelse(forecast.tab.FH$p.value<0.0001, "<0.0001",
+                                  sprintf("%.4f", round(forecast.tab.FH$p.value,4)))
+
+forecast.tab.FH <- forecast.tab.FH %>%
+  dplyr::mutate(Estimate = round(Estimate,3),
+                SE = round(SE,3),
+                Test.value = round(Test.value,3))
+# write.csv(forecast.tab.FH, "forecast.tab.FH.csv")
+forecast.tab.FH
+```
 
