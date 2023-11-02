@@ -2,8 +2,10 @@
 
 This is the repository to the article "The dependence of forecasts on sampling frequency as a guide to optimizing monitoring in community ecology".
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7970886.svg)](https://doi.org/10.5281/zenodo.7970886)
 
+Second release: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10066786.svg)](https://doi.org/10.5281/zenodo.10066786)
+
+First release: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7970886.svg)](https://doi.org/10.5281/zenodo.7970886)
 
 ## Repository structure
 
