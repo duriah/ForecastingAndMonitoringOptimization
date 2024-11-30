@@ -14,7 +14,13 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.path='figure/', 
+  dev=c('pdf', 'tiff'),
+  dpi = 300,
+  fig.align="center"
+)
 ```
 
 
@@ -3047,7 +3053,7 @@ simplot2 <- ForecastsSumm2 %>%
 
 ### Figure 
 
-```{r Figure2, fig.height=11, fig.width=10, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
+```{r Figure2, fig.height=11.5, fig.width=10, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
 ## The results of the simulations are loaded in above
 
 ForecastsSumm <- Forecasts %>%
@@ -3216,12 +3222,12 @@ p.leg <- get_legend(p3e+theme(legend.position = "bottom") +
 (p.a+p.b.d+plot_layout(widths = c(2,1)))/
   (p.c+p.e+plot_layout(widths = c(2,1)))/
   (p.f+labs(tag="e")+p.g+labs(tag="f")+plot_layout(widths = c(1,2)))/
-  p.leg + plot_layout(heights = c(4,4,4,1))
+  p.leg + plot_layout(heights = c(4,4,4,1)) + plot_annotation(title = "\n\nFigure 2", )
 ```
 
 ## Interaction figure 
 
-```{r Figure3, fig.height=10, fig.width=10, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
+```{r Figure3, fig.height=10.5, fig.width=10, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
 # numint, freq
 
 p2.a <- dd_subsample %>%
@@ -3310,14 +3316,14 @@ p2.f <- dd_timepoints %>%
   scale_color_manual(values = palette, aesthetics = c("fill","col"))+
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-(p2.a + p2.b + p2.e + p2.f + p2.c + p2.d + plot_layout(ncol = 2))/p.leg + plot_layout(heights = c(12,1))
+(p2.a + p2.b + p2.e + p2.f + p2.c + p2.d + plot_layout(ncol = 2))/p.leg + plot_layout(heights = c(12,1)) + plot_annotation(title = "\n\nFigure 3")
 ```
 
 
 
 ## Influence of sampling design on the detection of correlations between variables
 
-```{r Figure4, fig.height=7, fig.width=8, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
+```{r Figure4, fig.height=7.5, fig.width=8, warning=FALSE, dev=c('png', 'pdf', 'svg', 'tiff')}
 secondrow <- c(`1/12 of time points` = "#1B9E77", 
                `2/12 of time points` = "#D95F02", `3/12 of time points` = "#7570B3", 
                `6/12 of time points` = "#E7298A", `9/12 of time points` = "#E6AB02", 
@@ -3443,7 +3449,7 @@ fig4Daug2 <- dd.slopes %>%
 
 
 # (fig4a2.2+fig4b2.2)/(fig4a2.tp.2+fig4b2.tp.2)/(fig4Daug1+fig4Daug2) + plot_layout(heights = c(4,4,1))
-fig4a2.2 + fig4b2.2 + fig4a2.tp.2 + fig4b2.tp.2 + fig4Daug1 + fig4Daug2 + plot_layout(ncol = 2, heights = c(4,4,1))
+fig4a2.2 + fig4b2.2 + fig4a2.tp.2 + fig4b2.tp.2 + fig4Daug1 + fig4Daug2 + plot_layout(ncol = 2, heights = c(4,4,1)) + plot_annotation(title = "\n\nFigure 4")
 ```
 
 
@@ -3591,6 +3597,42 @@ ddHF_GRE2_plot2 %>%
   facet_wrap(~Name,scales = "free", nrow = 6)+
   labs(y="Value", x="Date")
 ```
+
+```{r ciliates, fig.height=3, fig.width=8, include=FALSE}
+presiplot <- ddHF_GRE2_plot2 %>%
+  dplyr::filter(Name=="Ciliates") 
+
+presiplot <- presiplot%>%
+  group_by(subgroup, group, Name) %>%
+  mutate(d.since.start = date - min(presiplot$date))
+
+
+
+presiplot %>%
+  ggplot(aes(date, value))+
+  geom_line(col="#e41a1c", size=0.5) +
+  # geom_line(data = presiplot %>%dplyr::filter(d.since.start %in% seq(0,2000,by=30)), col="black")+
+  geom_line(data = presiplot %>%dplyr::filter(d.since.start %in% seq(0,2000,by=14)), col="#377eb8", size=0.7)+
+  standard_theme() +
+  theme(axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(size=14),
+        axis.title = element_text(size=18))+
+  labs(y="Ciliates abundance", x="Year")
+
+presiplot %>%
+  ggplot(aes(date, value))+
+  # geom_line(col="#e41a1c") +
+  # geom_line(data = presiplot %>%dplyr::filter(d.since.start %in% seq(0,2000,by=30)), col="black")+
+  geom_line(data = presiplot %>%dplyr::filter(d.since.start %in% seq(0,2000,by=14)), col="#377eb8", size=0.7)+
+  standard_theme() +
+  theme(axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(size=14),
+        axis.title = element_text(size=18))+
+  labs(y="Ciliates abundance", x="Year")
+```
+
 
 
 #### S1.2.2 Motivation and justification of phytoplankton binning

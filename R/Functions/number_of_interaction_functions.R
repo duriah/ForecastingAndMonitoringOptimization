@@ -67,7 +67,8 @@ CCM_significance <- function(data, target, interactor, libsize, step=25, E, surr
   
   rho_surr <- data.frame(interactor_rho = numeric(1000))
   
-  interactor_data = as.data.frame(cbind(data[,1], ts, surr_interactor))
+  interactor_data = as.data.frame(cbind(data[,1], unlist(data[,target]), surr_interactor))
+  # interactor_data = as.data.frame(cbind(data[,1], ts, surr_interactor))
   names(interactor_data) = c("time", target, paste("T", as.character(seq(1, 1000)),	sep = ""))
   
   for (i in 1:1000) {
